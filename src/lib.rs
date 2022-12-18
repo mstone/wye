@@ -1,14 +1,28 @@
-pub fn add(left: usize, right: usize) -> usize {
-    left + right
-}
+pub mod log {
+    use petgraph::graph::Graph;
+    pub struct Logger {
+        graph: Graph<String, String>,
+    }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+    impl Logger {
+        fn new() -> Self {
+            Self {
+                graph: Graph::new(),
+            }
+        }
     }
 }
+
+pub mod collections {
+    pub struct Vec {}
+
+    pub struct HashMap {}
+
+    pub struct HashSet {}
+
+    pub struct BTreeMap {}
+
+    pub struct BTreeSet {}
+
+}
+
