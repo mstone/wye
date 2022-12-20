@@ -45,4 +45,9 @@ name = "wye"
 version = "0.1.0"
 dependencies = [
  "petgraph",
+ "wye-impl",
 ]
+
+[[package]]
+name = "wye-impl"
+version = "0.1.0"
