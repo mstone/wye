@@ -15,3 +15,4 @@ syn = { version = "1", features = [ "extra-traits", "full", "visit", "visit-mut"
 
 [dev-dependencies]
 trybuild = "*"
+wye = { path = ".." }

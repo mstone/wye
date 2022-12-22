@@ -1,5 +1,5 @@
 // Check that the simplest use of the #[wye] attribute proc-macro compiles.
-use wye_impl::wye;
+use wye::*;
 
 #[wye]
 fn add(a: u64, b: u64) -> u64 { a + b }

@@ -70,44 +70,54 @@
 //! * [PANDA](https://github.com/panda-re/panda)
 //! * [pernosco](https://pernos.co)
 
-pub mod log {
-    use petgraph::graph::Graph;
-    pub struct Logger {
-        graph: Graph<String, String>,
-    }
+use std::{fmt::Display, sync::Once, collections::HashMap};
 
-    impl Logger {
-        fn new() -> Self {
-            Self {
-                graph: Graph::new(),
-            }
+pub use wye_impl::wye;
+
+pub struct Wye {
+    graph: petgraph::graph::Graph<String, String>,
+    nodes: HashMap<u64, petgraph::graph::NodeIndex>,
+}
+
+impl Wye {
+    fn new() -> Self {
+        Wye {
+            graph: petgraph::graph::Graph::new(),
+            nodes: HashMap::new(),
         }
     }
-}
 
-pub mod expr {
-    pub struct Place {
-
+    pub fn node<V: Display>(&mut self, hash: u64, var: Option<impl Display>, val: V) -> u64 {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.nodes.entry(hash) {
+            let weight = var.map(|var| format!("{var} = {val}")).unwrap_or_else(|| format!("{val}"));
+            let node = self.graph.add_node(weight);
+            e.insert(node);
+        }
+        hash
     }
 
-    pub struct Rvalue {
-
+    pub fn edge(&mut self, from: u64, to: u64) {
+        let from = self.nodes[&from];
+        let to = self.nodes[&to];
+        self.graph.add_edge(from, to, "".into());
     }
 }
 
-pub mod iter {
-
+impl Display for Wye {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let dot = petgraph::dot::Dot::new(&self.graph);
+        dot.fmt(f)
+    }
 }
 
-pub mod collections {
-    pub struct Vec {}
+static mut WYE: Option<Wye> = None;
+static mut INIT: std::sync::Once = Once::new();
 
-    pub struct HashMap {}
-
-    pub struct HashSet {}
-
-    pub struct BTreeMap {}
-
-    pub struct BTreeSet {}
-
+pub fn get_wye<'a>() -> &'a mut Wye {
+    unsafe {
+        INIT.call_once(|| {
+            WYE = Some(Wye::new());
+        });
+        WYE.as_mut().unwrap()
+    }
 }
