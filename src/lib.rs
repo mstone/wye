@@ -72,11 +72,12 @@
 
 use std::{fmt::Display, sync::Once, collections::HashMap};
 
-pub use wye_impl::wye;
+pub use wye_impl::{wye, wyre};
 
 pub struct Wye {
     graph: petgraph::graph::Graph<String, String>,
-    nodes: HashMap<u64, petgraph::graph::NodeIndex>,
+    nodes: HashMap<(u64, u64), petgraph::graph::NodeIndex>,
+    frames: u64,
 }
 
 impl Wye {
@@ -84,11 +85,12 @@ impl Wye {
         Wye {
             graph: petgraph::graph::Graph::new(),
             nodes: HashMap::new(),
+            frames: 0,
         }
     }
 
     pub fn node<V: Display>(&mut self, hash: u64, var: Option<impl Display>, val: V) -> u64 {
-        if let std::collections::hash_map::Entry::Vacant(e) = self.nodes.entry(hash) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.nodes.entry((hash, self.frames)) {
             let weight = var.map(|var| format!("{var} = {val}")).unwrap_or_else(|| format!("{val}"));
             let node = self.graph.add_node(weight);
             e.insert(node);
@@ -97,9 +99,17 @@ impl Wye {
     }
 
     pub fn edge(&mut self, from: u64, to: u64) {
-        let from = self.nodes[&from];
-        let to = self.nodes[&to];
+        let from = self.nodes[&(from, self.frames)];
+        let to = self.nodes[&(to, self.frames)];
         self.graph.add_edge(from, to, "".into());
+    }
+
+    pub fn push_frame(&mut self) {
+        self.frames += 1;
+    }
+
+    pub fn pop_frame(&mut self) {
+        self.frames -= 1;
     }
 }
 

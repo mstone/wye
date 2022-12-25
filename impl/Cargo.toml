@@ -14,5 +14,6 @@ quote = "1"
 syn = { version = "1", features = [ "extra-traits", "full", "visit", "visit-mut" ] }
 
 [dev-dependencies]
+pretty_assertions = "*"
 trybuild = "*"
 wye = { path = ".." }

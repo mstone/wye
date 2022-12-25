@@ -1,7 +1,7 @@
 use std::{hash::{Hash, Hasher}, collections::hash_map::DefaultHasher};
 
 use quote::{ToTokens, format_ident};
-use syn::{parse_macro_input, parse_quote, Item};
+use syn::{parse_macro_input, parse_quote, Item, Expr};
 
 fn process_item(item: &mut Item) {
     if let Item::Fn(item_fn) = item {
@@ -26,6 +26,7 @@ fn process_sig_stmts(sig: &mut syn::Signature, stmts: &mut Vec<syn::Stmt>) {
     let mut result = vec![];
 
     result.push(parse_quote!(let WYE = get_wye(); ));
+    result.push(parse_quote!(WYE.push_frame();));
 
     for input in inputs.iter() {
         if let syn::FnArg::Typed(syn::PatType{pat, ..}) = input {
@@ -98,11 +99,30 @@ fn process_stmt(result: &mut Vec<syn::Stmt>, _inputs: &syn::punctuated::Punctuat
     result.push(stmt.clone());
 }
 
+fn process_expr(expr: &mut Expr) {
+    if let Expr::Call(call) = expr {
+        let args = &mut call.args;
+        for arg in args {
+            process_expr(arg);
+        }
+    }
+}
+
+
+
 #[proc_macro_attribute]
 pub fn wye(args: proc_macro::TokenStream, input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let _ = args;
     let mut input = parse_macro_input!(input as Item);
     process_item(&mut input);
+    let tokens = input.into_token_stream();
+    tokens.into()
+}
+
+#[proc_macro]
+pub fn wyre(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let mut input = parse_macro_input!(input as Expr);
+    process_expr(&mut input);
     let tokens = input.into_token_stream();
     tokens.into()
 }
