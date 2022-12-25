@@ -1,7 +1,8 @@
 use std::{hash::{Hash, Hasher}, collections::hash_map::DefaultHasher};
 
-use quote::{ToTokens, format_ident};
-use syn::{parse_macro_input, parse_quote, Item, Expr, punctuated::Punctuated, token::Comma};
+use proc_macro2::TokenStream;
+use quote::{ToTokens, format_ident, TokenStreamExt};
+use syn::{parse_macro_input, parse_quote, Item, Expr, punctuated::Punctuated, token::Comma, Block, Stmt};
 
 fn process_item(item: &mut Item) {
     if let Item::Fn(item_fn) = item {
@@ -72,7 +73,6 @@ fn process_stmt(result: &mut Vec<syn::Stmt>, _inputs: &syn::punctuated::Punctuat
 
                             let qop = format!("{}", op.to_token_stream());
 
-                            // let qop = "foo";
                             let stmts: Vec<syn::Stmt> = parse_quote!(
                                 WYE.node(FRAME, #hash_op, None::<String>, #qop);
                                 let r = #expr;
@@ -81,7 +81,6 @@ fn process_stmt(result: &mut Vec<syn::Stmt>, _inputs: &syn::punctuated::Punctuat
                                 WYE.edge(FRAME, #hash_r, FRAME, #hash_op);
                                 WYE.edge(FRAME, #hash_op, FRAME, #hash_expr);
                             );
-                            // result.append(&mut stmts);
                             result.push(parse_quote!({
                                 #(#stmts)*;
                                 r
@@ -96,24 +95,13 @@ fn process_stmt(result: &mut Vec<syn::Stmt>, _inputs: &syn::punctuated::Punctuat
     result.push(stmt.clone());
 }
 
-fn process_expr(expr: &mut Expr, stack: &mut Vec<Expr>) {
-    if let Expr::Call(call) = expr {
-        let args = &mut call.args;
-        stack.push(*call.func.clone());
-
-        let has_nested_call = args.iter().any(|arg| {
-            matches!(arg, Expr::Call(_))
-        });
-
-        if has_nested_call {
-            rewrite_expr(expr);
-        }
-
-        stack.pop();
+fn process_expr(expr: &mut Expr) {
+    if matches!(expr, Expr::Call(_)) {
+        rewrite_expr(expr, false);
     }
 }
 
-fn rewrite_expr(expr: &mut Expr) {
+fn rewrite_expr(expr: &mut Expr, defer_pop: bool) {
     if let Expr::Call(call) = expr {
         let mut stmts: Vec<syn::Stmt> = vec![];
         let mut args2: Punctuated<Expr, Comma> = Punctuated::new();
@@ -123,7 +111,7 @@ fn rewrite_expr(expr: &mut Expr) {
         for (n, arg) in call.args.iter_mut().enumerate() {
             let argn = format_ident!("arg{}", n);
             if matches!(arg, Expr::Call(_)) {
-                rewrite_expr(arg);
+                rewrite_expr(arg, false);
                 stmts.push(parse_quote!(
                     let #argn = #arg;
                 ));
@@ -141,14 +129,41 @@ fn rewrite_expr(expr: &mut Expr) {
             args2.push(parse_quote!(#argn));
         }
         call.args = args2;
+        let pop: Stmt = if defer_pop { parse_quote!({}) } else { parse_quote!(
+            WYE.pop_frame();
+        )};
         let mut call2 = parse_quote!({
             let WYE = get_wye();
             #(#stmts)*;
             let ret = #call;
-            WYE.pop_frame();
+            #pop
             ret
         });
         std::mem::swap(expr, &mut call2);
+    }
+}
+
+fn process_local(local: &mut syn::Local) {
+    if let syn::Local{init: Some((_, expr)), ..} = local {
+        let expr: &mut Expr = expr;
+        rewrite_expr(expr, true);
+    }    
+}
+
+struct Stmts(Vec<Stmt>);
+
+impl syn::parse::Parse for Stmts {
+    fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
+        Block::parse_within(input).map(Stmts)
+    }
+}
+
+impl quote::ToTokens for Stmts {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        let brace_token = syn::token::Brace::default();
+        brace_token.surround(tokens, |tokens| {
+            tokens.append_all(&self.0);
+        });
     }
 }
 
@@ -163,9 +178,18 @@ pub fn wye(args: proc_macro::TokenStream, input: proc_macro::TokenStream) -> pro
 
 #[proc_macro]
 pub fn wyre(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    let mut input = parse_macro_input!(input as Expr);
-    let mut stack = vec![];
-    process_expr(&mut input, &mut stack);
+    let mut input = parse_macro_input!(input as Stmts);
+    for stmt in input.0.iter_mut() {
+        match stmt {
+            Stmt::Local(local) => {
+                process_local(local); 
+            },
+            Stmt::Expr(expr) => {
+                process_expr(expr);
+            },
+            _ => {},
+        }
+    }
     let tokens = input.into_token_stream();
     tokens.into()
 }
