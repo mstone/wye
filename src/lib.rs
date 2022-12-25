@@ -77,7 +77,8 @@ pub use wye_impl::{wye, wyre};
 pub struct Wye {
     graph: petgraph::graph::Graph<String, String>,
     nodes: HashMap<(u64, u64), petgraph::graph::NodeIndex>,
-    frames: u64,
+    frames: Vec<Vec<Option<(u64, u64)>>>,
+    last_node: Option<(u64, u64)>,
 }
 
 impl Wye {
@@ -85,31 +86,49 @@ impl Wye {
         Wye {
             graph: petgraph::graph::Graph::new(),
             nodes: HashMap::new(),
-            frames: 0,
+            frames: vec![vec![]],
+            last_node: None,
         }
     }
 
-    pub fn node<V: Display>(&mut self, hash: u64, var: Option<impl Display>, val: V) -> u64 {
-        if let std::collections::hash_map::Entry::Vacant(e) = self.nodes.entry((hash, self.frames)) {
+    pub fn node<V: Display>(&mut self, frame: u64, slot: u64, var: Option<impl Display>, val: V) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.nodes.entry((frame, slot)) {
             let weight = var.map(|var| format!("{var} = {val}")).unwrap_or_else(|| format!("{val}"));
             let node = self.graph.add_node(weight);
             e.insert(node);
+            self.last_node = Some((frame, slot));
         }
-        hash
     }
 
-    pub fn edge(&mut self, from: u64, to: u64) {
-        let from = self.nodes[&(from, self.frames)];
-        let to = self.nodes[&(to, self.frames)];
+    pub fn edge(&mut self, from_frame: u64, from_slot: u64, to_frame: u64, to_slot: u64) {
+        let from = self.nodes[&(from_frame, from_slot)];
+        let to = self.nodes[&(to_frame, to_slot)];
         self.graph.add_edge(from, to, "".into());
     }
 
     pub fn push_frame(&mut self) {
-        self.frames += 1;
+        self.frames.push(vec![]);
     }
 
     pub fn pop_frame(&mut self) {
-        self.frames -= 1;
+        self.frames.pop();
+    }
+
+    pub fn push_lit(&mut self) {
+        self.frames.last_mut().unwrap().push(None);
+    }
+
+    pub fn push_var(&mut self, addr: (u64, u64)) {
+        self.frames.last_mut().unwrap().push(Some(addr));
+    }
+
+    pub fn frame(&self) -> (u64, Vec<Option<(u64, u64)>>) {
+        let fno = self.frames.len() as u64 - 1;
+        (fno, self.frames.last().unwrap().clone())
+    }
+
+    pub fn last_node(&self) -> (u64, u64) {
+        self.last_node.unwrap()
     }
 }
 

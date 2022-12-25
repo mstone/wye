@@ -1,7 +1,7 @@
 use std::{hash::{Hash, Hasher}, collections::hash_map::DefaultHasher};
 
 use quote::{ToTokens, format_ident};
-use syn::{parse_macro_input, parse_quote, Item, Expr};
+use syn::{parse_macro_input, parse_quote, Item, Expr, punctuated::Punctuated, token::Comma};
 
 fn process_item(item: &mut Item) {
     if let Item::Fn(item_fn) = item {
@@ -26,17 +26,19 @@ fn process_sig_stmts(sig: &mut syn::Signature, stmts: &mut Vec<syn::Stmt>) {
     let mut result = vec![];
 
     result.push(parse_quote!(let WYE = get_wye(); ));
-    result.push(parse_quote!(WYE.push_frame();));
+    result.push(parse_quote!(let (FRAME, FRAME_ARGS) = WYE.frame();));
 
-    for input in inputs.iter() {
+    for (input_slot, input) in inputs.iter().enumerate() {
         if let syn::FnArg::Typed(syn::PatType{pat, ..}) = input {
             if let syn::Pat::Ident(pat_ident) = pat.as_ref() {
                 let qvar = format!("{}", pat_ident.ident);
-                let hash_var = hash(&pat_ident.ident.to_string());
-                let qnode = format_ident!("node_{}", hash_var);
-                result.push(parse_quote!(
-                    let #qnode = WYE.node(#hash_var, Some(#qvar), #pat);
-                ));
+                let slot = hash(&pat_ident.ident.to_string());
+                result.push(parse_quote!({
+                    WYE.node(FRAME, #slot, Some(#qvar), #pat);
+                    if let Some((arg_frame, arg_slot)) = FRAME_ARGS.get(#input_slot).copied().flatten() {
+                        WYE.edge(arg_frame, arg_slot, FRAME, #slot);
+                    }
+                }));
             }
         }
     }
@@ -63,26 +65,21 @@ fn process_stmt(result: &mut Vec<syn::Stmt>, _inputs: &syn::punctuated::Punctuat
                 if let Some(left_ident) = left_path.get_ident() {
                     if let syn::Expr::Path(syn::ExprPath{path: right_path, ..}) = right {
                         if let Some(right_ident) = right_path.get_ident() {
-                            let hash_left = hash(left_ident.to_string());
-                            let hash_right = hash(right_ident.to_string());
+                            let hash_l = hash(left_ident.to_string());
+                            let hash_r = hash(right_ident.to_string());
                             let hash_op = hash(op);
                             let hash_expr = hash(expr_binary);
 
                             let qop = format!("{}", op.to_token_stream());
 
-                            let node_ql = format_ident!("r#node_{}", format!("{}", hash_left));
-                            let node_qr = format_ident!("r#node_{}", format!("{}", hash_right));
-                            let node_qop = format_ident!("r#node_{}", format!("{}", hash_op));
-                            let node_expr = format_ident!("r#node_{}", format!("{}", hash_expr));
-
                             // let qop = "foo";
                             let stmts: Vec<syn::Stmt> = parse_quote!(
-                                let #node_qop = WYE.node(#hash_op, None::<String>, #qop);
+                                WYE.node(FRAME, #hash_op, None::<String>, #qop);
                                 let r = #expr;
-                                let #node_expr = WYE.node(#hash_expr, None::<String>, r);
-                                WYE.edge(#node_ql, #node_qop);
-                                WYE.edge(#node_qr, #node_qop);
-                                WYE.edge(#node_qop, #node_expr);
+                                WYE.node(FRAME, #hash_expr, None::<String>, r);
+                                WYE.edge(FRAME, #hash_l, FRAME, #hash_op);
+                                WYE.edge(FRAME, #hash_r, FRAME, #hash_op);
+                                WYE.edge(FRAME, #hash_op, FRAME, #hash_expr);
                             );
                             // result.append(&mut stmts);
                             result.push(parse_quote!({
@@ -99,16 +96,61 @@ fn process_stmt(result: &mut Vec<syn::Stmt>, _inputs: &syn::punctuated::Punctuat
     result.push(stmt.clone());
 }
 
-fn process_expr(expr: &mut Expr) {
+fn process_expr(expr: &mut Expr, stack: &mut Vec<Expr>) {
     if let Expr::Call(call) = expr {
         let args = &mut call.args;
-        for arg in args {
-            process_expr(arg);
+        stack.push(*call.func.clone());
+
+        let has_nested_call = args.iter().any(|arg| {
+            matches!(arg, Expr::Call(_))
+        });
+
+        if has_nested_call {
+            rewrite_expr(expr);
         }
+
+        stack.pop();
     }
 }
 
-
+fn rewrite_expr(expr: &mut Expr) {
+    if let Expr::Call(call) = expr {
+        let mut stmts: Vec<syn::Stmt> = vec![];
+        let mut args2: Punctuated<Expr, Comma> = Punctuated::new();
+        stmts.push(parse_quote!(
+            WYE.push_frame();
+        ));
+        for (n, arg) in call.args.iter_mut().enumerate() {
+            let argn = format_ident!("arg{}", n);
+            if matches!(arg, Expr::Call(_)) {
+                rewrite_expr(arg);
+                stmts.push(parse_quote!(
+                    let #argn = #arg;
+                ));
+                stmts.push(parse_quote!(
+                    WYE.push_var(WYE.last_node());
+                ));
+            } else {
+                stmts.push(parse_quote!(
+                    let #argn = #arg;
+                ));
+                stmts.push(parse_quote!(
+                    WYE.push_lit();
+                ));
+            }
+            args2.push(parse_quote!(#argn));
+        }
+        call.args = args2;
+        let mut call2 = parse_quote!({
+            let WYE = get_wye();
+            #(#stmts)*;
+            let ret = #call;
+            WYE.pop_frame();
+            ret
+        });
+        std::mem::swap(expr, &mut call2);
+    }
+}
 
 #[proc_macro_attribute]
 pub fn wye(args: proc_macro::TokenStream, input: proc_macro::TokenStream) -> proc_macro::TokenStream {
@@ -122,13 +164,8 @@ pub fn wye(args: proc_macro::TokenStream, input: proc_macro::TokenStream) -> pro
 #[proc_macro]
 pub fn wyre(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let mut input = parse_macro_input!(input as Expr);
-    process_expr(&mut input);
+    let mut stack = vec![];
+    process_expr(&mut input, &mut stack);
     let tokens = input.into_token_stream();
     tokens.into()
-}
-
-#[proc_macro_attribute]
-pub fn arg(args: proc_macro::TokenStream, input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    let _ = args;
-    input
 }
