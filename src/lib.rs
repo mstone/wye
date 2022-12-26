@@ -62,7 +62,7 @@ impl Wye {
         }
     }
 
-    pub fn node<V: Display>(&mut self, frame: u64, slot: u64, var: Option<impl Display>, val: V) {
+    pub fn node<V: Display>(&mut self, frame: u64, slot: u64, var: Option<impl Display>, val: &V) {
         if let std::collections::hash_map::Entry::Vacant(e) = self.nodes.entry((frame, slot)) {
             let weight = var.map(|var| format!("{var} = {val}")).unwrap_or_else(|| format!("{val}"));
             let node = self.graph.add_node(weight);
