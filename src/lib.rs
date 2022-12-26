@@ -48,6 +48,7 @@ pub struct Wye {
     nodes: HashMap<(u64, u64), petgraph::graph::NodeIndex>,
     frames: Vec<Vec<Option<(u64, u64)>>>,
     last_node: Option<(u64, u64)>,
+    epoch: u64,
 }
 
 impl Wye {
@@ -57,6 +58,7 @@ impl Wye {
             nodes: HashMap::new(),
             frames: vec![vec![]],
             last_node: None,
+            epoch: 0,
         }
     }
 
@@ -81,6 +83,7 @@ impl Wye {
 
     pub fn pop_frame(&mut self) {
         self.frames.pop();
+        self.epoch += 1;
     }
 
     pub fn push_lit(&mut self) {
@@ -92,8 +95,7 @@ impl Wye {
     }
 
     pub fn frame(&self) -> (u64, Vec<Option<(u64, u64)>>) {
-        let fno = self.frames.len() as u64 - 1;
-        (fno, self.frames.last().unwrap().clone())
+        (self.epoch, self.frames.last().unwrap().clone())
     }
 
     pub fn last_node(&self) -> (u64, u64) {

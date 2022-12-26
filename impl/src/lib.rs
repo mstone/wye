@@ -26,7 +26,7 @@ fn process_sig_stmts(sig: &mut syn::Signature, stmts: &mut Vec<syn::Stmt>) {
 
     let mut result = vec![];
 
-    result.push(parse_quote!(let WYE = get_wye(); ));
+    result.push(parse_quote!(let WYE = get_wye();));
     result.push(parse_quote!(let (FRAME, FRAME_ARGS) = WYE.frame();));
 
     for (input_slot, input) in inputs.iter().enumerate() {
@@ -95,13 +95,14 @@ fn process_stmt(result: &mut Vec<syn::Stmt>, _inputs: &syn::punctuated::Punctuat
     result.push(stmt.clone());
 }
 
-fn process_expr(expr: &mut Expr) {
+fn process_expr(mut expr: Expr) -> Vec<Stmt> {
     if matches!(expr, Expr::Call(_)) {
-        rewrite_expr(expr, false);
+        rewrite_expr(&mut expr);
     }
+    vec![Stmt::Expr(expr)]
 }
 
-fn rewrite_expr(expr: &mut Expr, defer_pop: bool) {
+fn rewrite_expr(expr: &mut Expr) {
     if let Expr::Call(call) = expr {
         let mut stmts: Vec<syn::Stmt> = vec![];
         let mut args2: Punctuated<Expr, Comma> = Punctuated::new();
@@ -110,44 +111,65 @@ fn rewrite_expr(expr: &mut Expr, defer_pop: bool) {
         ));
         for (n, arg) in call.args.iter_mut().enumerate() {
             let argn = format_ident!("arg{}", n);
-            if matches!(arg, Expr::Call(_)) {
-                rewrite_expr(arg, false);
-                stmts.push(parse_quote!(
-                    let #argn = #arg;
-                ));
-                stmts.push(parse_quote!(
-                    WYE.push_var(WYE.last_node());
-                ));
-            } else {
-                stmts.push(parse_quote!(
-                    let #argn = #arg;
-                ));
-                stmts.push(parse_quote!(
-                    WYE.push_lit();
-                ));
+            match arg {
+                Expr::Call(_) => {
+                    rewrite_expr(arg);
+                    stmts.push(parse_quote!(
+                        let #argn = #arg;
+                    ));
+                    stmts.push(parse_quote!(
+                        WYE.push_var(WYE.last_node());
+                    ));
+                },
+                Expr::Path(path) if path.path.get_ident().is_some() => {
+                    let ident = path.path.get_ident().unwrap();
+                    let slot = hash(&ident.to_string());
+                    stmts.push(parse_quote!(
+                        let #argn = #arg;
+                    ));
+                    stmts.push(parse_quote!(
+                        WYE.push_var((FRAME, #slot));
+                    ));
+                },
+                _ => {
+                    stmts.push(parse_quote!(
+                        let #argn = #arg;
+                    ));
+                    stmts.push(parse_quote!(
+                        WYE.push_lit();
+                    ));
+                }
             }
             args2.push(parse_quote!(#argn));
         }
         call.args = args2;
-        let pop: Stmt = if defer_pop { parse_quote!({}) } else { parse_quote!(
-            WYE.pop_frame();
-        )};
         let mut call2 = parse_quote!({
             let WYE = get_wye();
             #(#stmts)*;
             let ret = #call;
-            #pop
+            WYE.pop_frame();
             ret
         });
         std::mem::swap(expr, &mut call2);
     }
 }
 
-fn process_local(local: &mut syn::Local) {
-    if let syn::Local{init: Some((_, expr)), ..} = local {
-        let expr: &mut Expr = expr;
-        rewrite_expr(expr, true);
-    }    
+fn process_local(mut local: syn::Local) -> Vec<Stmt> {
+    if let syn::Local{pat: ref pat@syn::Pat::Ident(ref pat_ident), init: Some((_, ref mut expr)), ..} = local {
+        rewrite_expr(expr);
+        let qvar = format!("{}", pat_ident.ident);
+        let slot = hash(&pat_ident.ident.to_string());
+        let mut epilogue: Vec<Stmt> = parse_quote!({
+            let RET = WYE.last_node();
+            WYE.node(FRAME, #slot, Some(#qvar), #pat);
+            WYE.edge(RET.0, RET.1, FRAME, #slot);
+        });
+        let mut result = vec![Stmt::Local(local)];
+        result.append(&mut epilogue);
+        result
+    } else {
+        vec![Stmt::Local(local)]
+    }
 }
 
 struct Stmts(Vec<Stmt>);
@@ -179,17 +201,19 @@ pub fn wye(args: proc_macro::TokenStream, input: proc_macro::TokenStream) -> pro
 #[proc_macro]
 pub fn wyre(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let mut input = parse_macro_input!(input as Stmts);
-    for stmt in input.0.iter_mut() {
+    input.0 = input.0.into_iter().flat_map(|stmt| {
         match stmt {
             Stmt::Local(local) => {
-                process_local(local); 
+                process_local(local)
             },
             Stmt::Expr(expr) => {
-                process_expr(expr);
+                process_expr(expr)
             },
-            _ => {},
+            _ => {vec![stmt]},
         }
-    }
+    }).collect::<Vec<_>>();
+    input.0.insert(0, parse_quote!(let (FRAME, _) = WYE.frame();));
+    input.0.insert(0, parse_quote!(let WYE = get_wye();));
     let tokens = input.into_token_stream();
     tokens.into()
 }
