@@ -187,7 +187,7 @@ fn rewrite_expr(expr: &mut Expr) {
         for (n, arg) in call.args.iter_mut().enumerate() {
             let argn = format_ident!("arg{}", n);
             match arg {
-                Expr::Call(_) | Expr::Macro(_) => {
+                Expr::Call(_) | Expr::Macro(_) | Expr::Reference(_) => {
                     rewrite_expr(arg);
                     stmts.push(parse_quote!(
                         let #argn = #arg;
