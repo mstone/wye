@@ -2,7 +2,7 @@ use std::{hash::{Hash, Hasher}, collections::hash_map::DefaultHasher};
 
 use proc_macro2::TokenStream;
 use quote::{ToTokens, format_ident, TokenStreamExt};
-use syn::{parse_macro_input, parse_quote, Item, Expr, punctuated::Punctuated, token::{Comma}, Block, Stmt, Macro, parse2};
+use syn::{parse_macro_input, parse_quote, Item, Expr, punctuated::Punctuated, token::{Comma}, Block, Stmt, Macro, parse2, spanned::Spanned};
 
 fn process_item(item: &mut Item) {
     if let Item::Fn(item_fn) = item {
@@ -26,8 +26,10 @@ fn process_sig_stmts(sig: &mut syn::Signature, stmts: &mut Vec<syn::Stmt>) {
 
     let mut result = vec![];
 
-    result.push(parse_quote!(let WYE = get_wye();));
-    result.push(parse_quote!(let (FRAME, FRAME_ARGS) = WYE.frame();));
+    result.append(&mut parse_quote!(
+        let WYE = get_wye();
+        let (FRAME, FRAME_ARGS) = WYE.frame();
+    ));
 
     for (input_slot, input) in inputs.iter().enumerate() {
         if let syn::FnArg::Typed(syn::PatType{pat, ..}) = input {
@@ -187,30 +189,35 @@ fn rewrite_expr(expr: &mut Expr) {
         for (n, arg) in call.args.iter_mut().enumerate() {
             let argn = format_ident!("arg{}", n);
             match arg {
-                Expr::Call(_) | Expr::Macro(_) | Expr::Reference(_) => {
+                Expr::Call(_) | Expr::Macro(_) => {
                     rewrite_expr(arg);
-                    stmts.push(parse_quote!(
+                    stmts.append(&mut parse_quote!(
                         let #argn = #arg;
+                        WYE.push_var(WYE.last_node());
                     ));
-                    stmts.push(parse_quote!(
+                },
+                Expr::Reference(_) => {
+                    rewrite_expr(arg);
+                    let qarg = arg.span().unwrap().source_text();
+                    // let qarg: String = arg.to_token_stream().to_string();
+                    let slot = hash(&arg);
+                    stmts.append(&mut parse_quote!(
+                        let #argn = #arg;
+                        WYE.node(FRAME, #slot, Some(#qarg), &#argn);
                         WYE.push_var(WYE.last_node());
                     ));
                 },
                 Expr::Path(path) if path.path.get_ident().is_some() => {
                     let ident = path.path.get_ident().unwrap();
                     let slot = hash(&ident.to_string());
-                    stmts.push(parse_quote!(
+                    stmts.append(&mut parse_quote!(
                         let #argn = #arg;
-                    ));
-                    stmts.push(parse_quote!(
                         WYE.push_var((FRAME, #slot));
                     ));
                 },
                 _ => {
-                    stmts.push(parse_quote!(
+                    stmts.append(&mut parse_quote!(
                         let #argn = #arg;
-                    ));
-                    stmts.push(parse_quote!(
                         WYE.push_lit();
                     ));
                 }
