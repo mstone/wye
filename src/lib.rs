@@ -39,7 +39,7 @@
 //! * [PANDA](https://github.com/panda-re/panda)
 //! * [pernosco](https://pernos.co)
 
-use std::{fmt::Display, sync::Once, collections::HashMap};
+use std::{fmt::{Display}, sync::Once, collections::HashMap};
 
 pub use wye_impl::{wye, wyre};
 
@@ -62,9 +62,9 @@ impl Logger {
         }
     }
 
-    pub fn node<V: Display>(&mut self, frame: u64, slot: u64, var: Option<impl Display>, val: &V) {
+    pub fn node(&mut self, frame: u64, slot: u64, var: Option<String>, val: String) {
         if let std::collections::hash_map::Entry::Vacant(e) = self.nodes.entry((frame, slot)) {
-            let weight = var.map(|var| format!("{var} = {val}")).unwrap_or_else(|| format!("{val}"));
+            let weight = var.map(|var| format!("{var} = {val}")).unwrap_or_else(|| val);
             let node = self.graph.add_node(weight);
             e.insert(node);
             self.last_node = Some((frame, slot));
@@ -72,8 +72,8 @@ impl Logger {
     }
 
     pub fn edge(&mut self, from_frame: u64, from_slot: u64, to_frame: u64, to_slot: u64) {
-        let from = self.nodes[&(from_frame, from_slot)];
-        let to = self.nodes[&(to_frame, to_slot)];
+        let from = self.nodes.get(&(from_frame, from_slot)).copied().unwrap_or_else(|| panic!("no entry found for from key: {from_frame}, {from_slot}"));
+        let to = self.nodes.get(&(to_frame, to_slot)).copied().unwrap_or_else(|| panic!("no entry found for to key: {to_frame}, {to_slot}"));
         self.graph.add_edge(from, to, "".into());
     }
 

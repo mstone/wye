@@ -7,4 +7,5 @@ fn test() {
     t.pass("tests/04-let.rs");
     t.pass("tests/05-format.rs");
     t.pass("tests/06-slice.rs");
+    t.pass("tests/07-debug.rs");
 }
