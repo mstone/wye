@@ -43,7 +43,7 @@ use std::{fmt::Display, sync::Once, collections::HashMap};
 
 pub use wye_impl::{wye, wyre};
 
-pub struct Wye {
+pub struct Logger {
     graph: petgraph::graph::Graph<String, String>,
     nodes: HashMap<(u64, u64), petgraph::graph::NodeIndex>,
     frames: Vec<Vec<Option<(u64, u64)>>>,
@@ -51,9 +51,9 @@ pub struct Wye {
     epoch: u64,
 }
 
-impl Wye {
+impl Logger {
     fn new() -> Self {
-        Wye {
+        Self {
             graph: petgraph::graph::Graph::new(),
             nodes: HashMap::new(),
             frames: vec![vec![]],
@@ -103,20 +103,20 @@ impl Wye {
     }
 }
 
-impl Display for Wye {
+impl Display for Logger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let dot = petgraph::dot::Dot::new(&self.graph);
         dot.fmt(f)
     }
 }
 
-static mut WYE: Option<Wye> = None;
+static mut WYE: Option<Logger> = None;
 static mut INIT: std::sync::Once = Once::new();
 
-pub fn get_wye<'a>() -> &'a mut Wye {
+pub fn get_wye<'a>() -> &'a mut Logger {
     unsafe {
         INIT.call_once(|| {
-            WYE = Some(Wye::new());
+            WYE = Some(Logger::new());
         });
         WYE.as_mut().unwrap()
     }
