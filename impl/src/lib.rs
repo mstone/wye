@@ -120,7 +120,6 @@ fn rewrite_expr_macro(result: &mut Vec<Stmt>, expr: &Expr) {
             
             let mut input_stmts: Vec<syn::Stmt> = Vec::new();
             let format_args: FormatArgs = parse2(tokens.clone()).unwrap();
-            eprintln!("FORMAT ARGS: {format_args:?}");
             for arg in format_args.0.iter().skip(1) {
                 match arg {
                     syn::Expr::Path(syn::ExprPath{path, ..}) => {
@@ -258,8 +257,7 @@ fn rewrite_expr(expr: &mut Expr) {
 
 fn process_inner_item(mut item: Item) -> Vec<Stmt> {
     if let Item::Macro(syn::ItemMacro{ref mut mac, ..}) = &mut item {
-        let syn::Macro{path, tokens, ..} = mac;
-        eprintln!("MACRO TOKENS: {tokens:?}");
+        let syn::Macro{path, ..} = mac;
         if path.is_ident("format") {
             rewrite_format_macro(mac);
         }
@@ -385,7 +383,6 @@ pub fn wye(args: proc_macro::TokenStream, input: proc_macro::TokenStream) -> pro
 pub fn wyre(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let mut input = parse_macro_input!(input as Stmts);
     input.0 = input.0.into_iter().flat_map(|stmt| {
-        // eprintln!("WYRE {stmt:?}");
         match stmt {
             Stmt::Local(local) => {
                 process_local(local)
