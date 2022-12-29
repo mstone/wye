@@ -21,7 +21,7 @@ fn process_sig_block(args: &WyeArgMap, sig: &mut syn::Signature, block: &mut syn
 }
 
 fn process_sig_stmts(args: &WyeArgMap, sig: &mut syn::Signature, stmts: &mut Vec<syn::Stmt>) {
-    let syn::Signature{inputs, output, ..} = sig;
+    let syn::Signature{generics, inputs, output, ..} = sig;
     let _ = output;
 
     let mut result = vec![];
@@ -41,9 +41,9 @@ fn process_sig_stmts(args: &WyeArgMap, sig: &mut syn::Signature, stmts: &mut Vec
                     _ => parse_quote!(#ident: &#ty),
                 };
                 let to_string_fn: Item = args.get(&pat_ident.ident).cloned().map(|expr| {
-                    parse_quote!(fn to_string(#closure_arg) -> String { #expr })
+                    parse_quote!(fn to_string #generics (#closure_arg) -> String { #expr })
                 }).unwrap_or_else(|| {
-                    parse_quote!(fn to_string(#closure_arg) -> String { #ident.to_string() })
+                    parse_quote!(fn to_string #generics (#closure_arg) -> String { #ident.to_string() })
                 });
                 let slot = hash(pat_ident.ident.to_string());
                 result.push(parse_quote!({
