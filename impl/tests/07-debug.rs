@@ -36,7 +36,7 @@ impl Deref for OnlyDisplay {
     }
 }
 
-#[wye(a: |x| format!("{x:?}"), b: |b| format!("{b}"))]
+#[wye(a: format!("{a:?}"), b: format!("{b}"))]
 fn concat(a: OnlyDebug, b: OnlyDisplay) -> String { format!("{:?} {}", &a, &b) }
 
 const EXPECTED_GRAPH: &str = r#"

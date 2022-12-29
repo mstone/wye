@@ -34,13 +34,21 @@ fn process_sig_stmts(args: &WyeArgMap, sig: &mut syn::Signature, stmts: &mut Vec
     for (input_slot, input) in inputs.iter().enumerate() {
         if let syn::FnArg::Typed(syn::PatType{pat, ty, ..}) = input {
             if let syn::Pat::Ident(pat_ident) = pat.as_ref() {
-                let to_string_expr = args.get(&pat_ident.ident).cloned().unwrap_or_else(|| {
-                    parse_quote!(|x: &#ty| x.to_string())
-                });
+                let ident = pat_ident.ident.clone();
                 let qvar = format!("{}", pat_ident.ident);
+                let closure_arg: syn::FnArg = match &**ty {
+                    syn::Type::ImplTrait(_) => parse_quote!(#ident: impl ToString),
+                    _ => parse_quote!(#ident: &#ty),
+                };
+                let to_string_fn: Item = args.get(&pat_ident.ident).cloned().map(|expr| {
+                    parse_quote!(fn to_string(#closure_arg) -> String { #expr })
+                }).unwrap_or_else(|| {
+                    parse_quote!(fn to_string(#closure_arg) -> String { #ident.to_string() })
+                });
                 let slot = hash(pat_ident.ident.to_string());
                 result.push(parse_quote!({
-                    WYE.node(FRAME, #slot, Some((#qvar).to_string()), ((#to_string_expr)(&#pat)));
+                    #to_string_fn
+                    WYE.node(FRAME, #slot, Some((#qvar).to_string()), to_string(&#pat));
                     if let Some((arg_frame, arg_slot)) = FRAME_ARGS.get(#input_slot).copied().flatten() {
                         WYE.edge(arg_frame, arg_slot, FRAME, #slot);
                     }
@@ -122,6 +130,17 @@ fn rewrite_expr_macro(result: &mut Vec<Stmt>, expr: &Expr) {
             let format_args: FormatArgs = parse2(tokens.clone()).unwrap();
             for arg in format_args.0.iter().skip(1) {
                 match arg {
+                    syn::Expr::MethodCall(syn::ExprMethodCall{receiver, ..}) => {
+                        if let Expr::Path(syn::ExprPath{path, ..}, ..) = &**receiver {
+                            if let Some(ident) = path.get_ident() {
+                                let hash_arg = hash(ident);
+                                input_stmts.push(parse_quote!(
+                                    WYE.edge(FRAME, #hash_arg, FRAME, #hash_op);
+                                ));
+                            }
+                        }
+                        // TODO: handle methodcall args...
+                    },
                     syn::Expr::Path(syn::ExprPath{path, ..}) => {
                         if let Some(ident) = path.get_ident() {
                             let hash_arg = hash(ident);
@@ -373,7 +392,8 @@ pub fn wye(args: proc_macro::TokenStream, input: proc_macro::TokenStream) -> pro
         parse_macro_input!(args as WyeArgs).process()
     } else {
         WyeArgMap::new()
-    };    let mut input = parse_macro_input!(input as Item);
+    };
+    let mut input = parse_macro_input!(input as Item);
     process_item(&args, &mut input);
     let tokens = input.into_token_stream();
     tokens.into()
