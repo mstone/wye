@@ -40,10 +40,11 @@ fn process_sig_stmts(args: &WyeArgMap, sig: &mut syn::Signature, stmts: &mut Vec
                     syn::Type::ImplTrait(_) => parse_quote!(#ident: impl ToString),
                     _ => parse_quote!(#ident: &#ty),
                 };
+                let (impl_generics, _ty_generics, where_clause) = generics.split_for_impl();
                 let to_string_fn: Item = args.get(&pat_ident.ident).cloned().map(|expr| {
-                    parse_quote!(fn to_string #generics (#closure_arg) -> String { #expr })
+                    parse_quote!(fn to_string #impl_generics (#closure_arg) -> String #where_clause { #expr })
                 }).unwrap_or_else(|| {
-                    parse_quote!(fn to_string #generics (#closure_arg) -> String { #ident.to_string() })
+                    parse_quote!(fn to_string #impl_generics (#closure_arg) -> String #where_clause { #ident.to_string() })
                 });
                 let slot = hash(pat_ident.ident.to_string());
                 result.push(parse_quote!({
