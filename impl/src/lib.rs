@@ -31,25 +31,43 @@ fn process_sig_stmts(args: &WyeArgMap, sig: &mut syn::Signature, stmts: &mut Vec
         let (FRAME, FRAME_ARGS) = WYE.frame();
     ));
 
+    let ref_inputs = inputs.iter().map(|input| {
+        if let syn::FnArg::Typed(syn::PatType{pat, ..}) = input {
+            if let syn::Pat::Ident(syn::PatIdent{ident, ..}) = pat.as_ref() {
+                let ref_arg: syn::Expr = parse_quote!(&#ident);
+                return ref_arg;
+            }
+        }
+        panic!("untyped fn arg");
+    }).collect::<Punctuated<syn::Expr, Comma>>();
+
     for (input_slot, input) in inputs.iter().enumerate() {
-        if let syn::FnArg::Typed(syn::PatType{pat, ty, ..}) = input {
+        if let syn::FnArg::Typed(syn::PatType{pat, ..}) = input {
             if let syn::Pat::Ident(pat_ident) = pat.as_ref() {
                 let ident = pat_ident.ident.clone();
                 let qvar = format!("{}", pat_ident.ident);
-                let closure_arg: syn::FnArg = match &**ty {
-                    syn::Type::ImplTrait(_) => parse_quote!(#ident: impl ToString),
-                    _ => parse_quote!(#ident: &#ty),
-                };
+                let ref_arg_bindings = inputs.iter().map(|input| {
+                    if let syn::FnArg::Typed(syn::PatType{pat, ty, ..}) = input {
+                        if let syn::Pat::Ident(syn::PatIdent{ident, ..}) = pat.as_ref() {
+                            let ref_arg: syn::FnArg = match &**ty {
+                                syn::Type::ImplTrait(_) => parse_quote!(#ident: impl ToString),
+                                _ => parse_quote!(#ident: &#ty),
+                            };
+                            return ref_arg
+                        }
+                    }
+                    panic!("untyped fn argument");
+                }).collect::<Punctuated<syn::FnArg, Comma>>();
                 let (impl_generics, _ty_generics, where_clause) = generics.split_for_impl();
                 let to_string_fn: Item = args.get(&pat_ident.ident).cloned().map(|expr| {
-                    parse_quote!(fn to_string #impl_generics (#closure_arg) -> String #where_clause { #expr })
+                    parse_quote!(fn to_string #impl_generics (#ref_arg_bindings) -> String #where_clause { #expr })
                 }).unwrap_or_else(|| {
-                    parse_quote!(fn to_string #impl_generics (#closure_arg) -> String #where_clause { #ident.to_string() })
+                    parse_quote!(fn to_string #impl_generics (#ref_arg_bindings) -> String #where_clause { #ident.to_string() })
                 });
                 let slot = hash(pat_ident.ident.to_string());
                 result.push(parse_quote!({
                     #to_string_fn
-                    WYE.node(FRAME, #slot, Some((#qvar).to_string()), to_string(&#pat));
+                    WYE.node(FRAME, #slot, Some((#qvar).to_string()), to_string(#ref_inputs));
                     if let Some((arg_frame, arg_slot)) = FRAME_ARGS.get(#input_slot).copied().flatten() {
                         WYE.edge(arg_frame, arg_slot, FRAME, #slot);
                     }
