@@ -2,7 +2,7 @@ use std::{hash::{Hash, Hasher}, collections::{hash_map::DefaultHasher, HashMap}}
 
 use proc_macro2::TokenStream;
 use quote::{ToTokens, format_ident, TokenStreamExt};
-use syn::{parse_macro_input, parse_quote, Item, Expr, punctuated::Punctuated, token::{Comma}, Block, Stmt, Macro, parse2, spanned::Spanned, Ident,};
+use syn::{parse_macro_input, parse_quote, Item, Expr, punctuated::Punctuated, token::{Comma}, Block, Stmt, parse2, spanned::Spanned, Ident, FieldValue,};
 
 fn process_item(args: &WyeArgMap, item: &mut Item) {
     if let Item::Fn(item_fn) = item {
@@ -60,16 +60,18 @@ fn process_sig_stmts(args: &WyeArgMap, sig: &mut syn::Signature, stmts: &mut Vec
                 }).collect::<Punctuated<syn::FnArg, Comma>>();
                 let (impl_generics, _ty_generics, where_clause) = generics.split_for_impl();
                 let to_string_fn: Item = args.get(&pat_ident.ident).cloned().map(|expr| {
-                    parse_quote!(fn to_string #impl_generics (#ref_arg_bindings) -> String #where_clause { #expr })
+                    parse_quote!(#[allow(unused_variables)] fn to_string #impl_generics (#ref_arg_bindings) -> String #where_clause { #expr })
                 }).unwrap_or_else(|| {
-                    parse_quote!(fn to_string #impl_generics (#ref_arg_bindings) -> String #where_clause { #ident.to_string() })
+                    parse_quote!(#[allow(unused_variables)] fn to_string #impl_generics (#ref_arg_bindings) -> String #where_clause { #ident.to_string() })
                 });
                 let slot = hash(pat_ident.ident.to_string());
                 result.push(parse_quote!({
                     #to_string_fn
                     WYE.node(FRAME, #slot, Some((#qvar).to_string()), to_string(#ref_inputs));
                     if let Some((arg_frame, arg_slot)) = FRAME_ARGS.get(#input_slot).copied().flatten() {
-                        WYE.edge(arg_frame, arg_slot, FRAME, #slot);
+                        if arg_frame != FRAME || arg_slot != #slot {
+                            WYE.edge(arg_frame, arg_slot, FRAME, #slot);
+                        }
                     }
                 }));
             }
@@ -77,7 +79,7 @@ fn process_sig_stmts(args: &WyeArgMap, sig: &mut syn::Signature, stmts: &mut Vec
     }
 
     for stmt in stmts.iter() {
-        process_stmt(&mut result, inputs, stmt);
+        result.append(&mut process_stmt(args, inputs, stmt));
     }
 
     std::mem::swap(stmts, &mut result);
@@ -89,21 +91,22 @@ fn hash<T: Hash>(t: T) -> u64 {
     h.finish()
 }
 
-fn process_stmt(result: &mut Vec<syn::Stmt>, _inputs: &syn::punctuated::Punctuated<syn::FnArg, syn::token::Comma>, stmt: &syn::Stmt) {
+fn process_stmt(args: &WyeArgMap, _inputs: &syn::punctuated::Punctuated<syn::FnArg, syn::token::Comma>, stmt: &syn::Stmt) -> Vec<Stmt> {
+    if let syn::Stmt::Local(local) = stmt {
+        return process_local(args, local.clone());
+    }
     if let syn::Stmt::Expr(expr) = stmt {
         match expr {
             syn::Expr::Binary(_) => {
-                rewrite_expr_binary(result, expr);
-                return;
+                return process_expr_binary(expr);
             }
             syn::Expr::Macro(_) => {
-                rewrite_expr_macro(result, expr);
-                return;
+                return process_expr_macro(expr);
             }
             _ => (),
         }
     }
-    result.push(stmt.clone());
+    vec![stmt.clone()]
 }
 
 #[derive(Debug)]
@@ -129,7 +132,7 @@ impl quote::ToTokens for FormatArgs {
     }
 }
 
-fn rewrite_expr_macro(result: &mut Vec<Stmt>, expr: &Expr) {
+fn process_expr_macro(expr: &Expr) -> Vec<Stmt> {
     if let syn::Expr::Macro(expr_macro) = expr {
         let syn::ExprMacro{mac, ..} = expr_macro;
         let syn::Macro{path, tokens, ..} = mac;
@@ -185,15 +188,16 @@ fn rewrite_expr_macro(result: &mut Vec<Stmt>, expr: &Expr) {
             stmts.push(parse_quote!(
                 WYE.edge(FRAME, #hash_op, FRAME, #hash_expr);
             ));
-            result.push(parse_quote!({
+            return parse_quote!({
                 #(#stmts)*;
                 r
-            }));
+            });
         }
     }
+    vec![syn::Stmt::Expr(expr.clone())]
 }
 
-fn rewrite_expr_binary(result: &mut Vec<Stmt>, expr: &syn::Expr) {
+fn process_expr_binary(expr: &syn::Expr) -> Vec<Stmt> {
     if let syn::Expr::Binary(expr_binary) = expr {
         let syn::ExprBinary{left, right, op, ..} = expr_binary;
         let (left, right): (&syn::Expr, &syn::Expr) = (left, right);
@@ -216,15 +220,16 @@ fn rewrite_expr_binary(result: &mut Vec<Stmt>, expr: &syn::Expr) {
                             WYE.edge(FRAME, #hash_r, FRAME, #hash_op);
                             WYE.edge(FRAME, #hash_op, FRAME, #hash_expr);
                         );
-                        result.push(parse_quote!({
+                        return parse_quote!({
                             #(#stmts)*;
                             r
-                        }));
+                        });
                     }
                 }
             }
         }
     }
+    vec![syn::Stmt::Expr(expr.clone())]
 }
 
 fn process_expr(mut expr: Expr) -> Vec<Stmt> {
@@ -235,12 +240,50 @@ fn process_expr(mut expr: Expr) -> Vec<Stmt> {
 }
 
 fn rewrite_expr(expr: &mut Expr) {
+    // rewrite_expr_struct
+    if let Expr::Struct(expr_struct) = expr {
+        let expr_source_text = expr_struct.span().unwrap().source_text();
+        let mut stmts: Vec<syn::Stmt> = vec![];
+        let mut fields2: Punctuated<FieldValue, Comma> = Punctuated::new();
+        for (n, field) in expr_struct.fields.iter_mut().enumerate() {
+            let fieldn = format_ident!("field{}", n);
+            let FieldValue{member, expr, ..} = field;
+            let slot = hash(&member);
+            let qarg = member.span().unwrap().source_text();
+            rewrite_expr(expr);
+            stmts.append(&mut parse_quote!(
+                let #fieldn = #expr;
+                WYE.node(FRAME, #slot, Some((#qarg).to_string()), (&#fieldn).to_string());
+            ));
+            field.expr = parse_quote!(#fieldn);
+            fields2.push(field.clone());
+        }
+        expr_struct.fields = fields2;
+        let slot = hash(&expr_struct.path);
+        let edge_stmts: Vec<Stmt> = expr_struct.fields.iter().map(|field| {
+            let field_slot = hash(&field.member);
+            parse_quote!(
+                WYE.edge(FRAME, #field_slot, FRAME, #slot);
+            )
+        }).collect::<Vec<_>>();
+        let mut expr_struct2 = parse_quote!({
+            let WYE = get_wye();
+            WYE.push_frame();
+            let (FRAME, _) = WYE.frame();
+            #(#stmts)*;
+            let ret = #expr_struct;
+            WYE.node(FRAME, #slot, None::<String>, #expr_source_text.into());
+            #(#edge_stmts)*;
+            WYE.pop_frame();
+            ret
+        });
+        std::mem::swap(expr, &mut expr_struct2);
+        return;
+    }
+    // rewrite_expr_call
     if let Expr::Call(call) = expr {
         let mut stmts: Vec<syn::Stmt> = vec![];
         let mut args2: Punctuated<Expr, Comma> = Punctuated::new();
-        stmts.push(parse_quote!(
-            WYE.push_frame();
-        ));
         for (n, arg) in call.args.iter_mut().enumerate() {
             let argn = format_ident!("arg{}", n);
             match arg {
@@ -284,6 +327,8 @@ fn rewrite_expr(expr: &mut Expr) {
         call.args = args2;
         let mut call2 = parse_quote!({
             let WYE = get_wye();
+            WYE.push_frame();
+            let (FRAME, _) = WYE.frame();
             #(#stmts)*;
             let ret = #call;
             WYE.pop_frame();
@@ -293,37 +338,63 @@ fn rewrite_expr(expr: &mut Expr) {
     }
 }
 
-fn process_inner_item(mut item: Item) -> Vec<Stmt> {
-    if let Item::Macro(syn::ItemMacro{ref mut mac, ..}) = &mut item {
-        let syn::Macro{path, ..} = mac;
-        if path.is_ident("format") {
-            rewrite_format_macro(mac);
-        }
-    }
-    vec![Stmt::Item(item)]
-}
-
-fn rewrite_format_macro(mac: &mut Macro) {
-    // let syn::Macro{path, bang_token, delimiter, tokens} = mac;
-    let _ = mac;
-}
-
-fn process_local(mut local: syn::Local) -> Vec<Stmt> {
+fn process_local(_args: &WyeArgMap, mut local: syn::Local) -> Vec<Stmt> {
+    // process_local_pat_ident
     if let syn::Local{pat: ref pat@syn::Pat::Ident(ref pat_ident), init: Some((_, ref mut expr)), ..} = local {
         rewrite_expr(expr);
         let qvar = format!("{}", pat_ident.ident);
         let slot = hash(pat_ident.ident.to_string());
         let mut epilogue: Vec<Stmt> = parse_quote!({
+            // foo
             let RET = WYE.last_node();
             WYE.node(FRAME, #slot, Some((#qvar).to_string()), (&#pat).to_string());
             WYE.edge(RET.0, RET.1, FRAME, #slot);
         });
         let mut result = vec![Stmt::Local(local)];
         result.append(&mut epilogue);
-        result
-    } else {
-        vec![Stmt::Local(local)]
+        return result;
     }
+    // process_local_pat_struct
+    if let syn::Local{pat: syn::Pat::Struct(ref pat_struct), init: Some((_, ref mut expr)), ..} = local {
+        let local_var = match &**expr {
+            syn::Expr::Path(expr_path) => {
+                expr_path.path.get_ident().map(|expr_ident| {
+                    hash(expr_ident)
+                })
+            },
+            _ => None,
+        };
+        rewrite_expr(expr);
+        let mut result_inner: Vec<Stmt> = vec![];
+        for field_pat in pat_struct.fields.iter() {
+            if let syn::Member::Named(ident) = &field_pat.member {
+                let qvar = format!("{}", ident);
+                let slot = hash(ident.to_string());
+                result_inner.push(parse_quote!(
+                    WYE.node(FRAME, #slot, Some((#qvar).to_string()), (&#ident).to_string());
+                ));
+                if let Some(local_slot) = local_var {
+                    result_inner.push(parse_quote!(
+                        WYE.edge(FRAME, #local_slot, FRAME, #slot);
+                    ));
+                }
+            }
+        }
+        let local = Stmt::Local(local.clone());
+        let mut result: Vec<Stmt> = vec![local];
+        if let Some(local_slot) = local_var {
+            result.push(parse_quote!(
+                if let Some((arg_frame, arg_slot)) = FRAME_ARGS.get(#local_slot as usize).copied().flatten() {
+                    WYE.edge(arg_frame, arg_slot, FRAME, #local_slot);
+                }
+            ));
+        }
+        result.push(parse_quote!({
+            #(#result_inner)*;
+        }));
+        return result;
+    }
+    vec![Stmt::Local(local)]
 }
 
 struct Stmts(Vec<Stmt>);
@@ -424,13 +495,10 @@ pub fn wyre(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     input.0 = input.0.into_iter().flat_map(|stmt| {
         match stmt {
             Stmt::Local(local) => {
-                process_local(local)
+                process_local(&WyeArgMap::new(), local)
             },
             Stmt::Expr(expr) => {
                 process_expr(expr)
-            },
-            Stmt::Item(item) => {
-                process_inner_item(item)
             },
             _ => {vec![stmt]},
         }
