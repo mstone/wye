@@ -34,6 +34,8 @@
 //! 
 //! * [WyeArgs] and [WyeArgMap] are used by [wye] to support custom formatting.
 //! 
+//! * [process_stmts] is the root of the common logic shared by [wye] and [wyre].
+//! 
 //! ## Method
 //! 
 //! I need a way to take an expression, 
@@ -52,21 +54,19 @@ use std::{hash::{Hash, Hasher}, collections::{hash_map::DefaultHasher, HashMap}}
 
 use proc_macro2::TokenStream;
 use quote::{ToTokens, format_ident, TokenStreamExt};
-use syn::{parse_macro_input, parse_quote, Item, Expr, punctuated::Punctuated, token::{Comma}, Block, Stmt, parse2, spanned::Spanned, Ident, FieldValue, ItemFn, parenthesized,};
+use syn::{parse_macro_input, parse_quote, Item, Expr, punctuated::Punctuated, token::{Comma}, Block, Stmt, parse2, spanned::Spanned, Ident, FieldValue, ItemFn, parenthesized, Signature,};
 
 fn process_item(args: &WyeArgMap, item: &mut Item) {
     if let Item::Fn(item_fn) = item {
-        process_itemfn(args, item_fn);
+        let ItemFn{sig, block, ..} = item_fn;
+        let Block{stmts, ..} = &mut **block;
+        process_stmts(args, Some(sig), stmts);
     }
 }
 
-fn process_itemfn(args: &WyeArgMap, item_fn: &mut ItemFn) {
-    let ItemFn{sig, block, ..} = item_fn;
-    let Block{stmts, ..} = &mut **block;
-    process_stmts(args, stmts);
-}
-
-fn process_stmts(args: &WyeArgMap, stmts: &mut Vec<Stmt>) {
+/// Given custom formatting arguments `args` and an optional function signature `sig`, 
+/// rewrite the given statements `stmts` to simultaneously record dataflow.
+fn process_stmts(args: &WyeArgMap, sig: Option<&Signature>, stmts: &mut Vec<Stmt>) {
     
 }
 
@@ -230,7 +230,7 @@ pub fn wye(args: proc_macro::TokenStream, input: proc_macro::TokenStream) -> pro
 pub fn wyre(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let mut input = parse_macro_input!(input as WyreExpr);
     let args = input.args.as_ref().map(|args| args.1.process()).unwrap_or_else(WyeArgMap::new);
-    process_stmts(&args, &mut input.stmts.0);
+    process_stmts(&args, None::<&Signature>, &mut input.stmts.0);
     let tokens = input.into_token_stream();
     tokens.into()
 }
