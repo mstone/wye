@@ -1,9 +1,12 @@
-//! # wye
+//! # Overview
 //! 
 //! wye is a crate for instrumenting Rust code to record causal traces for debugging.
 //! 
+//! # Example
+//! 
 //! Consider a simple program:
 //! 
+//! ```rust
 //! #[wye]
 //! fn add(a: u64, b: u64) -> u64 {
 //!     a + b
@@ -12,9 +15,11 @@
 //! fn example() -> bool {
 //!     wyre!{add(1, add(2, 3))} == 6
 //! }
+//! ```
 //! 
 //! A causal trace for the execution of `add(...)` in example might be presented by:
 //! 
+//! ```dot
 //! digraph {
 //! 0 [ label = "a = 2" ]
 //! 1 [ label = "b = 3" ]
@@ -32,6 +37,33 @@
 //! 5 -> 6 [ label = "" ]
 //! 6 -> 7 [ label = "" ]
 //! }
+//! ```
+//! 
+//! # Guide-level explanation
+//! 
+//! [wye] transforms the functions it is used to annotate to record dataflow 
+//! from arguments to returned results.
+//! 
+//! [wyre] transforms the expressions -- typically call-sites -- that it spans
+//! to record data-flow from variables to arguments of the functions being called.
+//! 
+//! # Options
+//! 
+//! ## Custom Formatting
+//! 
+//! [wye] defaults to printing arguments via [std::fmt::Display] 
+//! (technically, [ToString]) but this default choice can be overriden on a
+//! per-argument basis by giving wye an expression for each argument
+//! to be specially printed, like:
+//! 
+//! ```rust
+//! #[wye(a: format!("{a:?}"), b: format!("{b:?}"))]
+//! fn concat(a: impl Debug + Display, b: impl Debug + Display) {
+//!     format!("{a} {b}")
+//! }
+//! ```
+//! 
+//! (Today, [wyre] unfortunately, requires [std::fmt::Display] impls.)
 //! 
 //! # See Also
 //! 
