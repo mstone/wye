@@ -51,10 +51,10 @@
 //! 
 //! ## Custom Formatting
 //! 
-//! [wye] defaults to printing arguments via [std::fmt::Display] 
+//! [wye] and [wyre] default to printing values via [std::fmt::Display] 
 //! (technically, [ToString]) but this default choice can be overriden on a
-//! per-argument basis by giving wye an expression for each argument
-//! to be specially printed, like:
+//! per-argument basis by giving [wye] or [wyre] an expression for each 
+//! argument to be specially printed, like:
 //! 
 //! ```rust
 //! #[wye(a: format!("{a:?}"), b: format!("{b:?}"))]
@@ -63,7 +63,15 @@
 //! }
 //! ```
 //! 
-//! (Today, [wyre] unfortunately, requires [std::fmt::Display] impls.)
+//! or
+//! 
+//! ```rust
+//! fn add(a: u64, b: u64) -> u64 {
+//!     wyre!{ (a: format!("{a:?}"), b: format!("{b:?}"))
+//!         a + b
+//!     }
+//! }
+//! ```
 //! 
 //! # See Also
 //! 
