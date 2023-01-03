@@ -49,25 +49,182 @@
 //! # See Also
 //! 
 //! * [wye](https://github.com/mstone/wye)
+#![feature(proc_macro_span)]
+use std::{collections::{HashMap, HashSet, hash_map::DefaultHasher, BTreeMap}, fmt::Display, hash::{Hash, Hasher}};
 
-use std::{hash::{Hash, Hasher}, collections::{hash_map::DefaultHasher, HashMap}};
+use proc_macro2::{TokenStream, Span};
+use quote::{ToTokens, TokenStreamExt};
+use rangemap::RangeMap;
+use syn::{parse_macro_input, Item, Expr, punctuated::Punctuated, token::{Comma}, Block, Stmt, Ident, parenthesized, visit::Visit, visit_mut::VisitMut, spanned::Spanned, PatIdent, Signature, ItemFn,};
 
-use proc_macro2::TokenStream;
-use quote::{ToTokens, format_ident, TokenStreamExt};
-use syn::{parse_macro_input, parse_quote, Item, Expr, punctuated::Punctuated, token::{Comma}, Block, Stmt, parse2, spanned::Spanned, Ident, FieldValue, ItemFn, parenthesized, Signature,};
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct LineColumn {
+    line: usize,
+    column: usize,
+}
 
-fn process_item(args: &WyeArgMap, item: &mut Item) {
-    if let Item::Fn(item_fn) = item {
-        let ItemFn{sig, block, ..} = item_fn;
-        let Block{stmts, ..} = &mut **block;
-        process_stmts(args, Some(sig), stmts);
+impl From<proc_macro2::LineColumn> for LineColumn {
+    fn from(lc: proc_macro2::LineColumn) -> Self {
+        Self {
+            line: lc.line,
+            column: lc.column,
+        }
     }
 }
 
-/// Given custom formatting arguments `args` and an optional function signature `sig`, 
-/// rewrite the given statements `stmts` to simultaneously record dataflow.
-fn process_stmts(args: &WyeArgMap, sig: Option<&Signature>, stmts: &mut Vec<Stmt>) {
-    
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct Bytespan {
+    source_hash: u64,
+    start: LineColumn,
+    end: LineColumn,
+}
+
+struct Place {}
+
+impl Display for Place {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Place")
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct Source {
+    ident: String
+}
+
+impl Display for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Source{{{}}}", self.ident)
+    }
+}
+
+impl<'ast> From<&'ast Ident> for Source {
+    fn from(ident: &'ast Ident) -> Self {
+        Self {
+            ident: ident.span().unwrap().source_text().unwrap(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Sources(HashSet<Source>);
+
+impl Sources {
+    fn new() -> Self {
+        Self(HashSet::new())
+    }
+
+    fn insert(&mut self, source: Source) {
+        self.0.insert(source);
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct Use {
+    ident: String
+}
+
+#[derive(Clone, Debug)]
+struct Uses(HashSet<Use>);
+
+impl Uses {
+    fn new() -> Self {
+        Self(HashSet::new())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Scopes {
+    source_hash: u64,
+    scopestack: Vec<(proc_macro::LineColumn, Sources)>,
+    scopes: RangeMap<proc_macro::LineColumn, Sources>,
+}
+
+impl Scopes {
+    fn new(source_hash: u64) -> Self {
+        Self{
+            source_hash,
+            scopestack: vec![],
+            scopes: RangeMap::new(),
+        }
+    }
+
+    fn bytespan(&self, span: Span) -> Bytespan {
+        Bytespan { 
+            source_hash: self.source_hash, 
+            start: span.start().into(), 
+            end: span.end().into() 
+        }
+    }
+
+    fn push_scope(&mut self, start: proc_macro::LineColumn) {
+        self.scopestack.push((start, Sources::new()));
+    }
+
+    fn pop_scope(&mut self, end: proc_macro::LineColumn) {
+        if let Some((start, scope)) = self.scopestack.pop() {
+            self.scopes.insert(start..end, scope);
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for Scopes {
+    fn visit_item_fn(&mut self, item_fn: &'ast ItemFn) {
+        self.push_scope(item_fn.span().unwrap().start());
+        syn::visit::visit_item_fn(self, item_fn);
+        self.pop_scope(item_fn.span().unwrap().end());
+    }
+
+    fn visit_block(&mut self, block: &'ast Block) {
+        self.push_scope(block.span().unwrap().start());
+        syn::visit::visit_block(self, block);
+        self.pop_scope(block.span().unwrap().end());
+    }
+
+    fn visit_pat_ident(&mut self, ident: &'ast PatIdent) {
+        self.scopestack
+            .last_mut()
+            .map(|ref mut scope| {
+                scope.1.insert(Source::from(&ident.ident))
+            });
+    }
+}
+
+struct Parts<'ast> {
+    #[allow(dead_code)] scopes: &'ast Scopes,
+}
+
+impl<'ast> Parts<'ast> {
+    fn new(scopes: &'ast Scopes) -> Self {
+        Self{
+            scopes,
+        }
+    }
+}
+
+impl<'ast> VisitMut for Parts<'ast> {
+    fn visit_expr_mut(&mut self, expr: &mut Expr) {
+        let expr_start = expr.span().unwrap().start();
+        let expr_end = expr.span().unwrap().end();
+        let expr_range = expr_start..expr_end;
+        let scopes = self.scopes.scopes.overlapping(&expr_range);
+        let scopes = scopes.collect::<Vec<_>>();
+        // let place = scopes.place(expr.span());
+        // let sources = scopes.sources(expr.span());
+        // let uses = scopes.uses(expr.span());
+        eprintln!("SCOPES: {scopes:?}");
+    }
+}
+
+fn record_dataflow(source: &Source, place: &Place) {
+    eprintln!("DATAFLOW: {source} -> {place}");
+}
+
+fn is_simple(expr: &Expr) -> bool {
+    if let Expr::Path(expr_path) = expr {
+        return expr_path.path.get_ident().is_some()
+    }
+    false
 }
 
 fn hash<T: Hash>(t: T) -> u64 {
@@ -220,8 +377,17 @@ pub fn wye(args: proc_macro::TokenStream, input: proc_macro::TokenStream) -> pro
     } else {
         WyeArgMap::new()
     };
+    
     let mut input = parse_macro_input!(input as Item);
-    process_item(&args, &mut input);
+    
+    let source_hash = hash(proc_macro::Span::call_site().source_text().unwrap()); 
+
+    let mut scopes = Scopes::new(source_hash);
+    scopes.visit_item(&input);
+
+    let mut parts = Parts::new(&scopes);
+    parts.visit_item_mut(&mut input);
+    
     let tokens = input.into_token_stream();
     tokens.into()
 }
@@ -229,8 +395,21 @@ pub fn wye(args: proc_macro::TokenStream, input: proc_macro::TokenStream) -> pro
 #[proc_macro]
 pub fn wyre(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let mut input = parse_macro_input!(input as WyreExpr);
+    
     let args = input.args.as_ref().map(|args| args.1.process()).unwrap_or_else(WyeArgMap::new);
-    process_stmts(&args, None::<&Signature>, &mut input.stmts.0);
+    
+    let source_hash = hash(proc_macro::Span::call_site().source_text().unwrap());
+    
+    let mut scopes = Scopes::new(source_hash);
+    for stmt in &input.stmts.0 {
+        scopes.visit_stmt(stmt)
+    }
+
+    let mut parts = Parts::new(&scopes);
+    for stmt in &mut input.stmts.0 {
+        parts.visit_stmt_mut(stmt);
+    }
+
     let tokens = input.into_token_stream();
     tokens.into()
 }

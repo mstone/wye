@@ -21,7 +21,8 @@ fn add(m: Multiple) -> u64 {
     a + b 
 }
 
-const EXPECTED_GRAPH: &str = r#"digraph {
+const EXPECTED_GRAPH: &str = r#"
+digraph {
     0 [ label = "a = 2" ]
     1 [ label = "b = 3" ]
     2 [ label = "Multiple{a: 2, b: 3}" ]
