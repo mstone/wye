@@ -50,17 +50,26 @@
 //! 
 //! * [wye](https://github.com/mstone/wye)
 #![feature(proc_macro_span)]
-use std::{collections::{HashMap, HashSet, hash_map::DefaultHasher, BTreeMap}, fmt::Display, hash::{Hash, Hasher}};
+use std::{collections::{HashMap, HashSet, hash_map::DefaultHasher}, fmt::Display, hash::{Hash, Hasher}, ops::Range};
 
 use proc_macro2::{TokenStream, Span};
 use quote::{ToTokens, TokenStreamExt};
 use rangemap::RangeMap;
-use syn::{parse_macro_input, Item, Expr, punctuated::Punctuated, token::{Comma}, Block, Stmt, Ident, parenthesized, visit::Visit, visit_mut::VisitMut, spanned::Spanned, PatIdent, Signature, ItemFn,};
+use syn::{parse_macro_input, Item, Expr, punctuated::Punctuated, token::{Comma}, Block, Stmt, Ident, parenthesized, visit::Visit, visit_mut::VisitMut, spanned::Spanned, PatIdent, ItemFn, parse_quote, BinOp,};
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct LineColumn {
     line: usize,
     column: usize,
+}
+
+impl From<proc_macro::LineColumn> for LineColumn {
+    fn from(lc: proc_macro::LineColumn) -> Self {
+        Self {
+            line: lc.line,
+            column: lc.column,
+        }
+    }
 }
 
 impl From<proc_macro2::LineColumn> for LineColumn {
@@ -77,6 +86,24 @@ struct Bytespan {
     source_hash: u64,
     start: LineColumn,
     end: LineColumn,
+}
+
+impl Bytespan {
+    fn new(source_hash: u64, span: Span) -> Self {
+        Self {
+            source_hash, 
+            start: span.start().into(), 
+            end: span.end().into(),
+        }
+    }
+
+    fn new_from_range(source_hash: u64, range: &Range<proc_macro::LineColumn>) -> Self {
+        Self {
+            source_hash,
+            start: range.start.into(),
+            end: range.end.into(),
+        }
+    }
 }
 
 struct Place {}
@@ -119,22 +146,46 @@ impl Sources {
     }
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct Use {
     ident: String
 }
 
-#[derive(Clone, Debug)]
-struct Uses(HashSet<Use>);
+impl From<&Ident> for Use {
+    fn from(ident: &Ident) -> Self {
+        Self{ident: ident.to_string()}
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Uses{
+    source_hash: u64,
+    uses: RangeMap<proc_macro::LineColumn, Use>,
+}
 
 impl Uses {
-    fn new() -> Self {
-        Self(HashSet::new())
+    fn new(source_hash: u64) -> Self {
+        Self {
+            source_hash,
+            uses: RangeMap::new(),
+        }
+    }
+
+    
+}
+
+impl<'ast> Visit<'ast> for Uses {
+    fn visit_ident(&mut self, ident: &'ast Ident) {
+        let ident_start = ident.span().unwrap().start();
+        let ident_end = ident.span().unwrap().end();
+        let ident_range = ident_start..ident_end;
+        self.uses.insert(ident_range, Use::from(ident));
     }
 }
 
 #[derive(Clone, Debug)]
 struct Scopes {
+    #[allow(dead_code)]
     source_hash: u64,
     scopestack: Vec<(proc_macro::LineColumn, Sources)>,
     scopes: RangeMap<proc_macro::LineColumn, Sources>,
@@ -146,14 +197,6 @@ impl Scopes {
             source_hash,
             scopestack: vec![],
             scopes: RangeMap::new(),
-        }
-    }
-
-    fn bytespan(&self, span: Span) -> Bytespan {
-        Bytespan { 
-            source_hash: self.source_hash, 
-            start: span.start().into(), 
-            end: span.end().into() 
         }
     }
 
@@ -191,13 +234,17 @@ impl<'ast> Visit<'ast> for Scopes {
 }
 
 struct Parts<'ast> {
-    #[allow(dead_code)] scopes: &'ast Scopes,
+    source_hash: u64,
+    scopes: &'ast Scopes,
+    uses: &'ast Uses,
 }
 
 impl<'ast> Parts<'ast> {
-    fn new(scopes: &'ast Scopes) -> Self {
+    fn new(source_hash: u64, scopes: &'ast Scopes, uses: &'ast Uses) -> Self {
         Self{
+            source_hash,
             scopes,
+            uses,
         }
     }
 }
@@ -209,22 +256,76 @@ impl<'ast> VisitMut for Parts<'ast> {
         let expr_range = expr_start..expr_end;
         let scopes = self.scopes.scopes.overlapping(&expr_range);
         let scopes = scopes.collect::<Vec<_>>();
+        let uses = self.uses.uses.overlapping(&expr_range);
+        let uses = uses.collect::<Vec<_>>();
+        let mut bindings: Vec<(_, Use, _, Sources)> = vec![];
+
+        for (var_range, var) in uses.iter().cloned() {
+            for (scope_range, scope) in scopes.iter().cloned().rev() {
+                if scope_range.contains(&var_range.start) && scope_range.contains(&var_range.end) {
+                    bindings.push((var_range, var.clone(), scope_range, scope.clone()));
+                    break;
+                }
+            }
+        }
+
+        // eprintln!("EXPR: {}", expr.to_token_stream().to_string());
+        // eprintln!("SCOPES: {:#?}", scopes);
+        // eprintln!("USES: {:#?}", uses);
+        // eprintln!("BINDINGS: {:#?}", bindings);
+        // eprintln!("");
+
+        let place = hash(Bytespan::new(self.source_hash, expr.span().unwrap().into()));
+
+        syn::visit_mut::visit_expr_mut(self, expr);
+
+        let mvar: Expr = if let Some(ident) = as_ident(expr) {
+            let ident = ident.to_string();
+            parse_quote!(Some(#ident.into()))
+        } else if let Some(binop) = as_binop(expr) {
+            let binop = binop.to_token_stream().to_string();
+            parse_quote!(Some(#binop.into()))
+        } else {
+            parse_quote!(None::<String>)
+        };
+
+        let edges: Vec<Stmt> = if as_ident(expr).is_some() {
+            vec![]
+        } else {
+            bindings.iter().map(|(var_range, var, scope_range, scope)| {
+                let var_place = hash(Bytespan::new_from_range(self.source_hash, var_range));
+                parse_quote!(__wye.edge(__wye_frame, #var_place, __wye_frame, #place);)
+            }).collect::<Vec<_>>()
+        };
+
+        *expr = parse_quote!(({
+            let __wye = get_wye();
+            let (__wye_frame, _) = __wye.frame();
+            let __wye_ret = #expr; 
+            __wye.node(__wye_frame, #place, #mvar, (&__wye_ret).to_string());
+            #(#edges)*;
+            __wye_ret
+        }));
+
         // let place = scopes.place(expr.span());
         // let sources = scopes.sources(expr.span());
         // let uses = scopes.uses(expr.span());
-        eprintln!("SCOPES: {scopes:?}");
+        // eprintln!("SCOPES: {scopes:?}");
     }
 }
 
-fn record_dataflow(source: &Source, place: &Place) {
-    eprintln!("DATAFLOW: {source} -> {place}");
-}
-
-fn is_simple(expr: &Expr) -> bool {
+fn as_ident(expr: &Expr) -> Option<&Ident> {
     if let Expr::Path(expr_path) = expr {
-        return expr_path.path.get_ident().is_some()
+        return expr_path.path.get_ident()
     }
-    false
+    None
+}
+
+fn as_binop(expr: &Expr) -> Option<&BinOp> {
+    if let Expr::Binary(expr_binary) = expr {
+        return Some(&expr_binary.op)
+    }
+    None
 }
 
 fn hash<T: Hash>(t: T) -> u64 {
@@ -377,6 +478,7 @@ pub fn wye(args: proc_macro::TokenStream, input: proc_macro::TokenStream) -> pro
     } else {
         WyeArgMap::new()
     };
+    let _ = args;
     
     let mut input = parse_macro_input!(input as Item);
     
@@ -385,7 +487,10 @@ pub fn wye(args: proc_macro::TokenStream, input: proc_macro::TokenStream) -> pro
     let mut scopes = Scopes::new(source_hash);
     scopes.visit_item(&input);
 
-    let mut parts = Parts::new(&scopes);
+    let mut uses = Uses::new(source_hash);
+    uses.visit_item(&input);
+
+    let mut parts = Parts::new(source_hash, &scopes, &uses);
     parts.visit_item_mut(&mut input);
     
     let tokens = input.into_token_stream();
@@ -397,7 +502,8 @@ pub fn wyre(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let mut input = parse_macro_input!(input as WyreExpr);
     
     let args = input.args.as_ref().map(|args| args.1.process()).unwrap_or_else(WyeArgMap::new);
-    
+    let _ = args;
+
     let source_hash = hash(proc_macro::Span::call_site().source_text().unwrap());
     
     let mut scopes = Scopes::new(source_hash);
@@ -405,7 +511,12 @@ pub fn wyre(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
         scopes.visit_stmt(stmt)
     }
 
-    let mut parts = Parts::new(&scopes);
+    let mut uses = Uses::new(source_hash);
+    for stmt in &input.stmts.0 {
+        uses.visit_stmt(stmt)
+    }
+
+    let mut parts = Parts::new(source_hash, &scopes, &uses);
     for stmt in &mut input.stmts.0 {
         parts.visit_stmt_mut(stmt);
     }

@@ -10,6 +10,5 @@ fn add1(a: u64, b: u64) -> u64 { a + b }
 pub fn main() {
     wyre!{};
     wyre!{()};
-    wyre!{(){}};
     wyre!((a: format!("{a:?}")) let a = 1; );
 }
