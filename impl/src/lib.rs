@@ -55,7 +55,7 @@ use std::{collections::{HashMap, HashSet, hash_map::DefaultHasher}, fmt::Display
 use proc_macro2::{TokenStream, Span};
 use quote::{ToTokens, TokenStreamExt};
 use rangemap::RangeMap;
-use syn::{parse_macro_input, Item, Expr, punctuated::Punctuated, token::{Comma}, Block, Stmt, Ident, parenthesized, visit::Visit, visit_mut::VisitMut, spanned::Spanned, PatIdent, ItemFn, parse_quote, BinOp,};
+use syn::{parse_macro_input, Item, Expr, punctuated::Punctuated, token::{Comma}, Block, Stmt, Ident, parenthesized, visit::Visit, visit_mut::VisitMut, spanned::Spanned, PatIdent, ItemFn, parse_quote, BinOp, ExprCall, Lit, Signature,};
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct LineColumn {
@@ -116,7 +116,8 @@ impl Display for Place {
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct Source {
-    ident: String
+    ident: String,
+    bytespan: Bytespan,
 }
 
 impl Display for Source {
@@ -125,10 +126,11 @@ impl Display for Source {
     }
 }
 
-impl<'ast> From<&'ast Ident> for Source {
-    fn from(ident: &'ast Ident) -> Self {
+impl Source {
+    fn new_from_ident(source_hash: u64, ident: &Ident) -> Self {
         Self {
             ident: ident.span().unwrap().source_text().unwrap(),
+            bytespan: Bytespan::new(source_hash, ident.span().into()),
         }
     }
 }
@@ -170,8 +172,6 @@ impl Uses {
             uses: RangeMap::new(),
         }
     }
-
-    
 }
 
 impl<'ast> Visit<'ast> for Uses {
@@ -187,8 +187,16 @@ impl<'ast> Visit<'ast> for Uses {
 struct Scopes {
     #[allow(dead_code)]
     source_hash: u64,
-    scopestack: Vec<(proc_macro::LineColumn, Sources)>,
-    scopes: RangeMap<proc_macro::LineColumn, Sources>,
+    scopestack: Vec<(ScopeKind, proc_macro::LineColumn, Sources)>,
+    scopes: RangeMap<proc_macro::LineColumn, (ScopeKind, Sources)>,
+}
+
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ScopeKind {
+    Fn,
+    Closure,
+    Block,
 }
 
 impl Scopes {
@@ -200,26 +208,26 @@ impl Scopes {
         }
     }
 
-    fn push_scope(&mut self, start: proc_macro::LineColumn) {
-        self.scopestack.push((start, Sources::new()));
+    fn push_scope(&mut self, kind: ScopeKind, start: proc_macro::LineColumn) {
+        self.scopestack.push((kind, start, Sources::new()));
     }
 
     fn pop_scope(&mut self, end: proc_macro::LineColumn) {
-        if let Some((start, scope)) = self.scopestack.pop() {
-            self.scopes.insert(start..end, scope);
+        if let Some((kind, start, scope)) = self.scopestack.pop() {
+            self.scopes.insert(start..end, (kind, scope));
         }
     }
 }
 
 impl<'ast> Visit<'ast> for Scopes {
     fn visit_item_fn(&mut self, item_fn: &'ast ItemFn) {
-        self.push_scope(item_fn.span().unwrap().start());
+        self.push_scope(ScopeKind::Fn, item_fn.span().unwrap().start());
         syn::visit::visit_item_fn(self, item_fn);
         self.pop_scope(item_fn.span().unwrap().end());
     }
 
     fn visit_block(&mut self, block: &'ast Block) {
-        self.push_scope(block.span().unwrap().start());
+        self.push_scope(ScopeKind::Block, block.span().unwrap().start());
         syn::visit::visit_block(self, block);
         self.pop_scope(block.span().unwrap().end());
     }
@@ -228,7 +236,7 @@ impl<'ast> Visit<'ast> for Scopes {
         self.scopestack
             .last_mut()
             .map(|ref mut scope| {
-                scope.1.insert(Source::from(&ident.ident))
+                scope.2.insert(Source::new_from_ident(self.source_hash, &ident.ident))
             });
     }
 }
@@ -247,10 +255,77 @@ impl<'ast> Parts<'ast> {
             uses,
         }
     }
+
+    fn visit_expr_call_arg_mut(&mut self, parent_expr_place: u64, expr: &mut Expr) {
+        let expr_clone = expr.clone();
+        self.visit_expr_mut(expr);
+        *expr = parse_quote!(({
+            let __wye_ret = #expr;
+            __wye.push_var(__wye.last_node());
+            __wye_ret
+        }));
+    }
+
+    fn visit_fn_block_mut(&mut self, sig: &Signature, node: &mut Block) {
+        self.visit_block_mut(node);
+        for (input_slot, input) in sig.inputs.iter().enumerate().rev() {
+            if let syn::FnArg::Typed(syn::PatType{pat, ..}) = input {
+                if let syn::Pat::Ident(syn::PatIdent{ident, ..}) = pat.as_ref() {
+                    let ident_str = ident.to_string();
+                    let bytespan = Bytespan::new(self.source_hash, ident.span().unwrap().into());
+                    let slot = hash(&bytespan);
+                    eprintln!("FN BYTESPAN: {bytespan:?} SLOT: {slot}");
+                    node.stmts.insert(0, parse_quote!(
+                        if let Some((__wye_arg_frame, __wye_arg_slot)) = __wye_frame_args.get(#input_slot).copied().flatten() {
+                            if __wye_arg_frame != __wye_frame || __wye_arg_slot != #slot {
+                                eprintln!("MATCH: {} found in slot {}", #ident_str, #input_slot);
+                                __wye.edge(__wye_arg_frame, __wye_arg_slot, __wye_frame, #slot);
+                            }
+                        }
+                    ));
+                    node.stmts.insert(0, parse_quote!(
+                        __wye.node(__wye_frame, #slot, Some(#ident_str.into()), (&#ident).to_string());
+                    ));
+                }
+            }  
+        }
+        node.stmts.insert(0, parse_quote!(eprintln!("FRAME: {}: ARGS: {:?}", __wye_frame, __wye_frame_args);));
+        node.stmts.insert(0, parse_quote!(let (__wye_frame, __wye_frame_args) = __wye.frame();));
+        node.stmts.insert(0, parse_quote!(let __wye = get_wye();));
+    }
 }
 
 impl<'ast> VisitMut for Parts<'ast> {
+
+    fn visit_item_fn_mut(&mut self, node: &mut ItemFn) {
+        eprintln!("VISIT ITEM FN");
+        // See syn::visit_mut::visit_item_fn_mut(self, node);
+        let sig_clone = node.sig.clone();
+        for it in &mut node.attrs {
+            self.visit_attribute_mut(it);
+        }
+        self.visit_visibility_mut(&mut node.vis);
+        self.visit_signature_mut(&mut node.sig);
+        self.visit_fn_block_mut(&sig_clone, &mut *node.block);
+        eprintln!("VISIT ITEM FN DONE");
+    }
+
+    fn visit_expr_call_mut(&mut self, node: &mut ExprCall) {
+        // See syn::visit_mut::visit_expr_call_mut(self, expr_call);
+        // however, when visiting children, don't visit the actual callable 
+        // being called
+        let expr_slot = hash(Bytespan::new(self.source_hash, node.span()));
+        for it in &mut node.attrs {
+            self.visit_attribute_mut(it);
+        }
+        for el in Punctuated::pairs_mut(&mut node.args) {
+            let (it, p) = el.into_tuple();
+            self.visit_expr_call_arg_mut(expr_slot, it);
+        }
+    }
+
     fn visit_expr_mut(&mut self, expr: &mut Expr) {
+        let expr_clone = expr.clone();
         let expr_start = expr.span().unwrap().start();
         let expr_end = expr.span().unwrap().end();
         let expr_range = expr_start..expr_end;
@@ -258,22 +333,23 @@ impl<'ast> VisitMut for Parts<'ast> {
         let scopes = scopes.collect::<Vec<_>>();
         let uses = self.uses.uses.overlapping(&expr_range);
         let uses = uses.collect::<Vec<_>>();
-        let mut bindings: Vec<(_, Use, _, Sources)> = vec![];
+        let mut bindings: Vec<(_, Use, _, ScopeKind, Source)> = vec![];
 
         for (var_range, var) in uses.iter().cloned() {
-            for (scope_range, scope) in scopes.iter().cloned().rev() {
+            for (scope_range, (scope_kind, sources)) in scopes.iter().cloned().rev() {
                 if scope_range.contains(&var_range.start) && scope_range.contains(&var_range.end) {
-                    bindings.push((var_range, var.clone(), scope_range, scope.clone()));
+                    sources.0.iter().find(|source| source.ident == var.ident).map(|source| {
+                        bindings.push((var_range, var.clone(), scope_range, *scope_kind, source.clone()));
+                    });
                     break;
                 }
             }
         }
 
-        // eprintln!("EXPR: {}", expr.to_token_stream().to_string());
+        eprintln!("EXPR: {}", expr.to_token_stream().to_string());
         // eprintln!("SCOPES: {:#?}", scopes);
         // eprintln!("USES: {:#?}", uses);
-        // eprintln!("BINDINGS: {:#?}", bindings);
-        // eprintln!("");
+        eprintln!("BINDINGS: {:#?}", bindings);
 
         let place = hash(Bytespan::new(self.source_hash, expr.span().unwrap().into()));
 
@@ -292,26 +368,65 @@ impl<'ast> VisitMut for Parts<'ast> {
         let edges: Vec<Stmt> = if as_ident(expr).is_some() {
             vec![]
         } else {
-            bindings.iter().map(|(var_range, var, scope_range, scope)| {
-                let var_place = hash(Bytespan::new_from_range(self.source_hash, var_range));
-                parse_quote!(__wye.edge(__wye_frame, #var_place, __wye_frame, #place);)
+            bindings.iter().filter_map(|(var_range, var, scope_range, scope_kind, source)| {
+                if scope_kind == &ScopeKind::Fn {
+                    let bytespan = &source.bytespan;
+                    let var_place = hash(&bytespan);
+                    eprintln!("CALL BYTESPAN: {bytespan:?} SLOT: {var_place}");
+                    return Some(parse_quote!(__wye.edge(__wye_frame, #var_place, __wye_frame, #place);))
+                }
+                None
             }).collect::<Vec<_>>()
         };
+        // eprintln!("EDGES: {edges:?}");
+        eprintln!("");
 
-        *expr = parse_quote!(({
-            let __wye = get_wye();
-            let (__wye_frame, _) = __wye.frame();
-            let __wye_ret = #expr; 
-            __wye.node(__wye_frame, #place, #mvar, (&__wye_ret).to_string());
-            #(#edges)*;
-            __wye_ret
-        }));
+        let expr_source = expr.span().unwrap().source_text();
+        match expr_clone {
+            Expr::Call(_) => {
+                *expr = parse_quote!((/* #[doc=#expr_source] */{
+                    let _ = #expr_source;
+                    let __wye = get_wye();
+                    let (__wye_outer_frame, _) = __wye.frame();
+                    __wye.declare_node(__wye_outer_frame, #place);
+                    __wye.push_frame();
+                    let __wye_ret = #expr;
+                    __wye.pop_frame();
+                    let (__wye_inner_frame, __wye_inner_slot) = __wye.last_node();
+                    __wye.define_node(__wye_outer_frame, #place, Some(#expr_source.into()), (&__wye_ret).to_string());
+                    __wye.edge(__wye_inner_frame, __wye_inner_slot, __wye_outer_frame, #place);
+                    #(#edges)*;
+                    __wye_ret
+                }));
+            },
+            _ if as_ident(&expr_clone).is_none() => {
+                *expr = parse_quote!(({
+                    let _ = #expr_source;
+                    let __wye = get_wye();
+                    let (__wye_frame, _) = __wye.frame();
+                    __wye.declare_node(__wye_frame, #place);
+                    let __wye_ret = #expr;
+                    __wye.define_node(__wye_frame, #place, #mvar, (&__wye_ret).to_string());
+                    #(#edges)*;
+                    __wye_ret
+                }));
+            },
+            _ => {},
+        }
+
 
         // let place = scopes.place(expr.span());
         // let sources = scopes.sources(expr.span());
         // let uses = scopes.uses(expr.span());
         // eprintln!("SCOPES: {scopes:?}");
     }
+}
+
+fn as_lit(expr: &Expr) -> Option<&Lit> {
+    if let Expr::Lit(lit) = expr {
+        return Some(&lit.lit)
+    }
+    None
 }
 
 fn as_ident(expr: &Expr) -> Option<&Ident> {

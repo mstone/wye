@@ -103,11 +103,37 @@ impl Logger {
     }
 
     pub fn node(&mut self, frame: u64, slot: u64, var: Option<String>, val: String) {
-        if let std::collections::hash_map::Entry::Vacant(e) = self.nodes.entry((frame, slot)) {
-            let weight = var.map(|var| format!("{var} = {val}")).unwrap_or_else(|| val);
-            let node = self.graph.add_node(weight);
-            e.insert(node);
-            self.last_node = Some((frame, slot));
+        self.declare_node(frame, slot);
+        self.define_node(frame, slot, var, val);
+    }
+
+    pub fn declare_node(&mut self, frame: u64, slot: u64) {
+        match self.nodes.entry((frame, slot)) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                panic!("already declared node: {frame}, {slot}");
+            },
+            std::collections::hash_map::Entry::Vacant(ve) => {
+                let node = self.graph.add_node(Default::default());
+                ve.insert(node);
+            },
+        }
+    }
+
+    pub fn define_node(&mut self, frame: u64, slot: u64, var: Option<String>, val: String) {
+        match self.nodes.entry((frame, slot)) {
+            std::collections::hash_map::Entry::Occupied(oe) => {
+                let weight = var.as_ref()
+                    .map(|var| format!("{var} = {val}"))
+                    .unwrap_or_else(|| val.clone());
+                let node = oe.get();
+                let node_weight = self.graph.node_weight_mut(*node)
+                    .expect(&format!("missing node: {frame}, {slot} for update: {var:?} = {val}"));
+                *node_weight = weight;
+                self.last_node = Some((frame, slot));
+            },
+            std::collections::hash_map::Entry::Vacant(ve) => {
+                panic!("undefined node: {frame}, {slot}");
+            },
         }
     }
 
