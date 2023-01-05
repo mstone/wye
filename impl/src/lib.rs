@@ -55,7 +55,7 @@ use std::{collections::{HashMap, HashSet, hash_map::DefaultHasher}, fmt::Display
 use proc_macro2::{TokenStream, Span};
 use quote::{ToTokens, TokenStreamExt};
 use rangemap::RangeMap;
-use syn::{parse_macro_input, Item, Expr, punctuated::Punctuated, token::{Comma}, Block, Stmt, Ident, parenthesized, visit::Visit, visit_mut::VisitMut, spanned::Spanned, PatIdent, ItemFn, parse_quote, BinOp, ExprCall, Lit, Signature,};
+use syn::{parse_macro_input, Item, Expr, punctuated::Punctuated, token::{Comma}, Block, Stmt, Ident, parenthesized, visit::Visit, visit_mut::VisitMut, spanned::Spanned, PatIdent, ItemFn, parse_quote, BinOp, ExprCall, Lit, Signature, ExprMacro, parse2,};
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct LineColumn {
@@ -175,6 +175,17 @@ impl Uses {
 }
 
 impl<'ast> Visit<'ast> for Uses {
+    fn visit_expr_macro(&mut self, node: &ExprMacro) {
+        let syn::ExprMacro{mac, ..} = node;
+        let syn::Macro{path, tokens, ..} = mac;
+        if let Some(ident) = path.get_ident() {
+            let format_args: FormatArgs = parse2(tokens.clone()).unwrap();
+            for arg in format_args.0.iter().skip(1) {
+                self.visit_expr(arg);
+            }
+        }
+    }
+
     fn visit_ident(&mut self, ident: &'ast Ident) {
         let ident_start = ident.span().unwrap().start();
         let ident_end = ident.span().unwrap().end();
@@ -256,7 +267,7 @@ impl<'ast> Parts<'ast> {
         }
     }
 
-    fn visit_expr_call_arg_mut(&mut self, parent_expr_place: u64, expr: &mut Expr) {
+    fn visit_expr_call_arg_mut(&mut self, expr: &mut Expr) {
         let expr_clone = expr.clone();
         self.visit_expr_mut(expr);
         *expr = parse_quote!(({
@@ -310,17 +321,28 @@ impl<'ast> VisitMut for Parts<'ast> {
         eprintln!("VISIT ITEM FN DONE");
     }
 
+    fn visit_expr_macro_mut(&mut self, node: &mut ExprMacro) {
+        let syn::ExprMacro{mac, ..} = node;
+        let syn::Macro{path, tokens, ..} = mac;
+        if let Some(ident) = path.get_ident() {
+            let mut format_args: FormatArgs = parse2(tokens.clone()).unwrap();
+            for arg in format_args.0.iter_mut().skip(1) {
+                self.visit_expr_mut(arg);
+            }
+            *tokens = format_args.to_token_stream();
+        }
+    }
+
     fn visit_expr_call_mut(&mut self, node: &mut ExprCall) {
         // See syn::visit_mut::visit_expr_call_mut(self, expr_call);
         // however, when visiting children, don't visit the actual callable 
         // being called
-        let expr_slot = hash(Bytespan::new(self.source_hash, node.span()));
         for it in &mut node.attrs {
             self.visit_attribute_mut(it);
         }
         for el in Punctuated::pairs_mut(&mut node.args) {
             let (it, p) = el.into_tuple();
-            self.visit_expr_call_arg_mut(expr_slot, it);
+            self.visit_expr_call_arg_mut(it);
         }
     }
 
@@ -348,7 +370,7 @@ impl<'ast> VisitMut for Parts<'ast> {
 
         eprintln!("EXPR: {}", expr.to_token_stream().to_string());
         // eprintln!("SCOPES: {:#?}", scopes);
-        // eprintln!("USES: {:#?}", uses);
+        eprintln!("USES: {:#?}", uses);
         eprintln!("BINDINGS: {:#?}", bindings);
 
         let place = hash(Bytespan::new(self.source_hash, expr.span().unwrap().into()));
@@ -373,7 +395,9 @@ impl<'ast> VisitMut for Parts<'ast> {
                     let bytespan = &source.bytespan;
                     let var_place = hash(&bytespan);
                     eprintln!("CALL BYTESPAN: {bytespan:?} SLOT: {var_place}");
-                    return Some(parse_quote!(__wye.edge(__wye_frame, #var_place, __wye_frame, #place);))
+                    return Some(parse_quote!(
+                        __wye.edge(__wye_frame, #var_place, __wye_frame, #place);
+                    ))
                 }
                 None
             }).collect::<Vec<_>>()
@@ -395,6 +419,18 @@ impl<'ast> VisitMut for Parts<'ast> {
                     let (__wye_inner_frame, __wye_inner_slot) = __wye.last_node();
                     __wye.define_node(__wye_outer_frame, #place, Some(#expr_source.into()), (&__wye_ret).to_string());
                     __wye.edge(__wye_inner_frame, __wye_inner_slot, __wye_outer_frame, #place);
+                    #(#edges)*;
+                    __wye_ret
+                }));
+            },
+            Expr::Macro(_) => {
+                *expr = parse_quote!((/* #[doc=#expr_source] */{
+                    let _ = #expr_source;
+                    let __wye = get_wye();
+                    let (__wye_outer_frame, _) = __wye.frame();
+                    __wye.declare_node(__wye_outer_frame, #place);
+                    let __wye_ret = #expr;
+                    __wye.define_node(__wye_outer_frame, #place, Some(#expr_source.into()), (&__wye_ret).to_string());
                     #(#edges)*;
                     __wye_ret
                 }));
