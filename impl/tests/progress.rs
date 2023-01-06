@@ -13,4 +13,5 @@ fn test() {
     // t.pass("tests/10-where-clause.rs");
     // t.pass("tests/11-multiple-generics.rs");
     // t.pass("tests/12-destructuring-let.rs");
+    t.pass("tests/13-none.rs");
 }

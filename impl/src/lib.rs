@@ -354,7 +354,7 @@ impl<'ast> Parts<'ast> {
                         }
                     ));
                     node.stmts.insert(0, parse_quote!(
-                        __wye.node(__wye_frame, #slot, Some(#ident_str.into()), (&#ident).to_string());
+                        __wye.node(__wye_frame, #slot, Some(#ident_str.into()), format!("{:?}", &#ident));
                     ));
                 }
             }
@@ -431,7 +431,7 @@ impl<'ast> Parts<'ast> {
                     let __wye_ret = #expr;
                     __wye.pop_frame();
                     let (__wye_inner_frame, __wye_inner_slot) = __wye.last_node();
-                    __wye.define_node(__wye_outer_frame, #place, Some(#expr_source.into()), (&__wye_ret).to_string());
+                    __wye.define_node(__wye_outer_frame, #place, Some(#expr_source.into()), format!("{:?}", &__wye_ret));
                     __wye.edge(__wye_inner_frame, __wye_inner_slot, __wye_outer_frame, #place);
                     #(#edges)*;
                     __wye_ret
@@ -445,7 +445,7 @@ impl<'ast> Parts<'ast> {
                     let (__wye_outer_frame, _) = __wye.frame();
                     __wye.declare_node(__wye_outer_frame, #place);
                     let __wye_ret = #expr;
-                    __wye.define_node(__wye_outer_frame, #place, Some(#expr_source.into()), (&__wye_ret).to_string());
+                    __wye.define_node(__wye_outer_frame, #place, Some(#expr_source.into()), format!("{:?}", &__wye_ret));
                     #(#edges)*;
                     __wye_ret
                 }));
@@ -461,7 +461,7 @@ impl<'ast> Parts<'ast> {
                         __wye.push_frame();
                         let __wye_ret = #inner_expr;
                         __wye.pop_frame();
-                        __wye.define_node(__wye_outer_frame, #place, #mvar, (&__wye_ret).to_string());
+                        __wye.define_node(__wye_outer_frame, #place, #mvar, format!("{:?}", &__wye_ret));
                         #(#edges)*;
                         __wye_ret
                     })
@@ -479,7 +479,7 @@ impl<'ast> Parts<'ast> {
                             let (__wye_frame, _) = __wye.frame();
                             __wye.declare_node(__wye_frame, #place);
                             let __wye_ret = #inner_expr;
-                            __wye.define_node(__wye_frame, #place, #mvar, (&__wye_ret).to_string());
+                            __wye.define_node(__wye_frame, #place, #mvar, format!("{:?}", &__wye_ret));
                             __wye.push_frame(); __wye.pop_frame();
                             __wye_ret
                         })
@@ -494,7 +494,7 @@ impl<'ast> Parts<'ast> {
                             __wye.declare_node(__wye_frame, #place);
                             let __wye_ret = #inner_expr;
                             let (__wye_expr_frame, __wye_expr_place) = __wye.last_node();
-                            __wye.define_node(__wye_frame, #place, #mvar, (&__wye_ret).to_string());
+                            __wye.define_node(__wye_frame, #place, #mvar, format!("{:?}", &__wye_ret));
                             #(#edges)*;
                             __wye.push_frame(); __wye.pop_frame();
                             __wye_ret
@@ -510,7 +510,7 @@ impl<'ast> Parts<'ast> {
                     let (__wye_frame, _) = __wye.frame();
                     __wye.declare_node(__wye_frame, #place);
                     let __wye_ret = #expr;
-                    __wye.define_node(__wye_frame, #place, #mvar, (&__wye_ret).to_string());
+                    __wye.define_node(__wye_frame, #place, #mvar, format!("{:?}", &__wye_ret));
                     #(#edges)*;
                     __wye_ret
                 }));
