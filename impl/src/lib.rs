@@ -310,7 +310,9 @@ impl<'ast> Parts<'ast> {
         self.visit_expr_mut(expr);
         if let Some(ident) = as_ident(&expr_clone) {
             let mut bindings = self.bindings(expr);
-            let (_var_range, _var, _scope_range, scope_kind, source) = bindings.pop().unwrap();
+            let (_var_range, _var, _scope_range, scope_kind, source) = bindings
+                .pop()
+                .unwrap_or_else(|| panic!("missing bindings for expr: {expr:?}"));
             if scope_kind == ScopeKind::Local {
                 let frame_ident = format_ident!("__wye_frame_{}", ident);
                 let var_place = hash(source.bytespan);
