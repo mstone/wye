@@ -50,12 +50,12 @@
 //! 
 //! * [wye](https://github.com/mstone/wye)
 #![feature(proc_macro_span)]
-use std::{collections::{HashMap, HashSet, hash_map::DefaultHasher}, fmt::Display, hash::{Hash, Hasher}, ops::Range, env::VarError};
+use std::{collections::{HashMap, HashSet, hash_map::DefaultHasher}, fmt::Display, hash::{Hash, Hasher}, ops::Range};
 
 use proc_macro2::{TokenStream, Span};
 use quote::{ToTokens, TokenStreamExt, format_ident};
 use rangemap::RangeMap;
-use syn::{parse_macro_input, Item, Expr, punctuated::Punctuated, token::{Comma}, Block, Stmt, Ident, parenthesized, visit::Visit, visit_mut::VisitMut, spanned::Spanned, PatIdent, ItemFn, parse_quote, BinOp, ExprCall, Lit, Signature, ExprMacro, parse2, ExprLet, Local,};
+use syn::{parse_macro_input, Item, Expr, punctuated::Punctuated, token::{Comma}, Block, Stmt, Ident, parenthesized, visit::Visit, visit_mut::VisitMut, spanned::Spanned, PatIdent, ItemFn, parse_quote, BinOp, ExprCall, Signature, ExprMacro, parse2, ExprLet, Local,};
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct LineColumn {
@@ -94,14 +94,6 @@ impl Bytespan {
             source_hash,
             start: span.start().into(),
             end: span.end().into(),
-        }
-    }
-
-    fn new_from_range(source_hash: u64, range: &Range<proc_macro::LineColumn>) -> Self {
-        Self {
-            source_hash,
-            start: range.start.into(),
-            end: range.end.into(),
         }
     }
 }
@@ -178,7 +170,7 @@ impl<'ast> Visit<'ast> for Uses {
     fn visit_expr_macro(&mut self, node: &ExprMacro) {
         let syn::ExprMacro{mac, ..} = node;
         let syn::Macro{path, tokens, ..} = mac;
-        if let Some(ident) = path.get_ident() {
+        if path.get_ident().is_some() {
             let format_args: FormatArgs = parse2(tokens.clone()).unwrap();
             for arg in format_args.0.iter().skip(1) {
                 self.visit_expr(arg);
@@ -206,7 +198,6 @@ struct Scopes {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum ScopeKind {
     Fn,
-    Closure,
     Block,
     Local,
 }
@@ -224,7 +215,7 @@ impl Scopes {
         self.scopestack.push((kind, start, end, Sources::new()));
     }
 
-    fn pop_scope(&mut self, end: proc_macro::LineColumn) {
+    fn pop_scope(&mut self, _end: proc_macro::LineColumn) {
         if let Some((kind, start, end, scope)) = self.scopestack.pop() {
             self.scopes.insert(start..end, (kind, scope));
         }
@@ -317,9 +308,9 @@ impl<'ast> Parts<'ast> {
     fn visit_expr_call_arg_mut(&mut self, expr: &mut Expr) {
         let expr_clone = expr.clone();
         self.visit_expr_mut(expr);
-        if let Some(ident) = as_ident(expr) {
+        if let Some(ident) = as_ident(&expr_clone) {
             let mut bindings = self.bindings(expr);
-            let (var_range, var, scope_range, scope_kind, source) = bindings.pop().unwrap();
+            let (_var_range, _var, _scope_range, scope_kind, source) = bindings.pop().unwrap();
             if scope_kind == ScopeKind::Local {
                 let frame_ident = format_ident!("__wye_frame_{}", ident);
                 let var_place = hash(source.bytespan);
@@ -401,7 +392,7 @@ impl<'ast> Parts<'ast> {
         let edges: Vec<Stmt> = if as_ident(expr).is_some() {
             vec![]
         } else {
-            bindings.iter().filter_map(|(var_range, var, scope_range, scope_kind, source)| {
+            bindings.iter().filter_map(|(_var_range, var, _scope_range, scope_kind, source)| {
                 if scope_kind == &ScopeKind::Fn {
                     let bytespan = &source.bytespan;
                     let var_place = hash(&bytespan);
@@ -457,7 +448,7 @@ impl<'ast> Parts<'ast> {
                     __wye_ret
                 }));
             },
-            Expr::Let(syn::ExprLet{pat: syn::Pat::Ident(ident), expr: inner_expr, ..}) if stmt_hack.is_none() => {
+            Expr::Let(syn::ExprLet{pat: syn::Pat::Ident(_ident), expr: inner_expr, ..}) if stmt_hack.is_none() => {
                 *expr = parse_quote!(
                     (get_wye().frame().0, {
                         let _ = "case: Expr::Let";
@@ -474,7 +465,7 @@ impl<'ast> Parts<'ast> {
                     })
                 );
             },
-            Expr::Let(syn::ExprLet{pat: syn::Pat::Ident(ident), expr: mut inner_expr, ..}) => {
+            Expr::Let(syn::ExprLet{pat: syn::Pat::Ident(_ident), expr: mut inner_expr, ..}) => {
                 syn::visit_mut::visit_expr_mut(self, inner_expr.as_mut());
                 *expr = parse_quote!(
                     (get_wye().frame().0, {
@@ -526,7 +517,7 @@ impl<'ast> VisitMut for Parts<'ast> {
     fn visit_expr_macro_mut(&mut self, node: &mut ExprMacro) {
         let syn::ExprMacro{mac, ..} = node;
         let syn::Macro{path, tokens, ..} = mac;
-        if let Some(ident) = path.get_ident() {
+        if path.get_ident().is_some() {
             let mut format_args: FormatArgs = parse2(tokens.clone()).unwrap();
             for arg in format_args.0.iter_mut().skip(1) {
                 self.visit_expr_mut(arg);
@@ -543,14 +534,12 @@ impl<'ast> VisitMut for Parts<'ast> {
             self.visit_attribute_mut(it);
         }
         for el in Punctuated::pairs_mut(&mut node.args) {
-            let (it, p) = el.into_tuple();
+            let (it, _p) = el.into_tuple();
             self.visit_expr_call_arg_mut(it);
         }
     }
 
     fn visit_stmt_mut(&mut self, stmt: &mut Stmt) {
-        let expr_clone = stmt.clone();
-        let expr_source = stmt.span().unwrap().source_text();
         match stmt {
             Stmt::Local(local) => {
                 if let Local{attrs, let_token, pat: pat@syn::Pat::Ident(ident), init: Some((eq_token, expr)), semi_token} = &local {
@@ -599,13 +588,6 @@ impl<'ast> VisitMut for Parts<'ast> {
     fn visit_expr_mut(&mut self, expr: &mut Expr) {
         self.compile(None, expr);
     }
-}
-
-fn as_lit(expr: &Expr) -> Option<&Lit> {
-    if let Expr::Lit(lit) = expr {
-        return Some(&lit.lit)
-    }
-    None
 }
 
 fn as_ident(expr: &Expr) -> Option<&Ident> {

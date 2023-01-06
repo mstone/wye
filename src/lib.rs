@@ -131,7 +131,7 @@ impl Logger {
                 *node_weight = weight;
                 self.last_node = Some((frame, slot));
             },
-            std::collections::hash_map::Entry::Vacant(ve) => {
+            std::collections::hash_map::Entry::Vacant(_) => {
                 panic!("undefined node: {frame}, {slot}");
             },
         }
