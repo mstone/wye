@@ -167,6 +167,10 @@ impl Logger {
     pub fn last_node(&self) -> (u64, u64) {
         self.last_node.unwrap()
     }
+
+    pub fn set_last_node(&mut self, addr: (u64, u64)) {
+        self.last_node = Some(addr);
+    }
 }
 
 impl Display for Logger {

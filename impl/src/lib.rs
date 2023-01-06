@@ -50,12 +50,12 @@
 //! 
 //! * [wye](https://github.com/mstone/wye)
 #![feature(proc_macro_span)]
-use std::{collections::{HashMap, HashSet, hash_map::DefaultHasher}, fmt::Display, hash::{Hash, Hasher}, ops::Range};
+use std::{collections::{HashMap, HashSet, hash_map::DefaultHasher}, fmt::Display, hash::{Hash, Hasher}, ops::Range, env::VarError};
 
 use proc_macro2::{TokenStream, Span};
-use quote::{ToTokens, TokenStreamExt};
+use quote::{ToTokens, TokenStreamExt, format_ident};
 use rangemap::RangeMap;
-use syn::{parse_macro_input, Item, Expr, punctuated::Punctuated, token::{Comma}, Block, Stmt, Ident, parenthesized, visit::Visit, visit_mut::VisitMut, spanned::Spanned, PatIdent, ItemFn, parse_quote, BinOp, ExprCall, Lit, Signature, ExprMacro, parse2,};
+use syn::{parse_macro_input, Item, Expr, punctuated::Punctuated, token::{Comma}, Block, Stmt, Ident, parenthesized, visit::Visit, visit_mut::VisitMut, spanned::Spanned, PatIdent, ItemFn, parse_quote, BinOp, ExprCall, Lit, Signature, ExprMacro, parse2, ExprLet, Local,};
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct LineColumn {
@@ -91,8 +91,8 @@ struct Bytespan {
 impl Bytespan {
     fn new(source_hash: u64, span: Span) -> Self {
         Self {
-            source_hash, 
-            start: span.start().into(), 
+            source_hash,
+            start: span.start().into(),
             end: span.end().into(),
         }
     }
@@ -198,7 +198,7 @@ impl<'ast> Visit<'ast> for Uses {
 struct Scopes {
     #[allow(dead_code)]
     source_hash: u64,
-    scopestack: Vec<(ScopeKind, proc_macro::LineColumn, Sources)>,
+    scopestack: Vec<(ScopeKind, proc_macro::LineColumn, proc_macro::LineColumn, Sources)>,
     scopes: RangeMap<proc_macro::LineColumn, (ScopeKind, Sources)>,
 }
 
@@ -208,6 +208,7 @@ enum ScopeKind {
     Fn,
     Closure,
     Block,
+    Local,
 }
 
 impl Scopes {
@@ -219,12 +220,12 @@ impl Scopes {
         }
     }
 
-    fn push_scope(&mut self, kind: ScopeKind, start: proc_macro::LineColumn) {
-        self.scopestack.push((kind, start, Sources::new()));
+    fn push_scope(&mut self, kind: ScopeKind, start: proc_macro::LineColumn, end: proc_macro::LineColumn) {
+        self.scopestack.push((kind, start, end, Sources::new()));
     }
 
     fn pop_scope(&mut self, end: proc_macro::LineColumn) {
-        if let Some((kind, start, scope)) = self.scopestack.pop() {
+        if let Some((kind, start, end, scope)) = self.scopestack.pop() {
             self.scopes.insert(start..end, (kind, scope));
         }
     }
@@ -232,22 +233,40 @@ impl Scopes {
 
 impl<'ast> Visit<'ast> for Scopes {
     fn visit_item_fn(&mut self, item_fn: &'ast ItemFn) {
-        self.push_scope(ScopeKind::Fn, item_fn.span().unwrap().start());
+        let span = item_fn.span().unwrap();
+        self.push_scope(ScopeKind::Fn, span.start(), span.end());
         syn::visit::visit_item_fn(self, item_fn);
-        self.pop_scope(item_fn.span().unwrap().end());
+        self.pop_scope(span.end());
     }
 
     fn visit_block(&mut self, block: &'ast Block) {
-        self.push_scope(ScopeKind::Block, block.span().unwrap().start());
+        let span = block.span().unwrap();
+        self.push_scope(ScopeKind::Block, span.start(), span.end());
         syn::visit::visit_block(self, block);
-        self.pop_scope(block.span().unwrap().end());
+        self.pop_scope(span.end());
+    }
+
+    fn visit_local(&mut self, node: &'ast Local) {
+        let span = node.span().unwrap();
+        let prev_end = self.scopestack.last().unwrap().2;
+        self.push_scope(ScopeKind::Local, span.start(), prev_end);
+        syn::visit::visit_local(self, node);
+        self.pop_scope(prev_end);
+    }
+
+    fn visit_expr_let(&mut self, node: &'ast ExprLet) {
+        let span = node.span().unwrap();
+        let prev_end = self.scopestack.last().unwrap().2;
+        self.push_scope(ScopeKind::Local, span.start(), prev_end);
+        syn::visit::visit_expr_let(self, node);
+        self.pop_scope(prev_end);
     }
 
     fn visit_pat_ident(&mut self, ident: &'ast PatIdent) {
         self.scopestack
             .last_mut()
             .map(|ref mut scope| {
-                scope.2.insert(Source::new_from_ident(self.source_hash, &ident.ident))
+                scope.3.insert(Source::new_from_ident(self.source_hash, &ident.ident))
             });
     }
 }
@@ -258,6 +277,10 @@ struct Parts<'ast> {
     uses: &'ast Uses,
 }
 
+type UseRange = Range<proc_macro::LineColumn>;
+type SourceRange = Range<proc_macro::LineColumn>;
+type Binding = (UseRange, Use, SourceRange, ScopeKind, Source);
+
 impl<'ast> Parts<'ast> {
     fn new(source_hash: u64, scopes: &'ast Scopes, uses: &'ast Uses) -> Self {
         Self{
@@ -267,14 +290,59 @@ impl<'ast> Parts<'ast> {
         }
     }
 
+    fn bindings(&self, expr: &Expr) -> Vec<Binding> {
+        let expr_start = expr.span().unwrap().start();
+        let expr_end = expr.span().unwrap().end();
+        let expr_range = expr_start..expr_end;
+        let scopes = self.scopes.scopes.overlapping(&expr_range);
+        let scopes = scopes.collect::<Vec<_>>();
+        let uses = self.uses.uses.overlapping(&expr_range);
+        let uses = uses.collect::<Vec<_>>();
+        let mut bindings: Vec<(_, Use, _, ScopeKind, Source)> = vec![];
+
+        for (var_range, var) in uses.iter().cloned() {
+            for (scope_range, (scope_kind, sources)) in scopes.iter().cloned().rev() {
+                if scope_range.contains(&var_range.start) && scope_range.contains(&var_range.end) {
+                    sources.0.iter().find(|source| source.ident == var.ident).map(|source| {
+                        bindings.push((var_range.clone(), var.clone(), scope_range.clone(), *scope_kind, source.clone()));
+                    });
+                    break;
+                }
+            }
+        }
+
+        bindings
+    }
+
     fn visit_expr_call_arg_mut(&mut self, expr: &mut Expr) {
         let expr_clone = expr.clone();
         self.visit_expr_mut(expr);
-        *expr = parse_quote!(({
-            let __wye_ret = #expr;
-            __wye.push_var(__wye.last_node());
-            __wye_ret
-        }));
+        if let Some(ident) = as_ident(expr) {
+            let mut bindings = self.bindings(expr);
+            let (var_range, var, scope_range, scope_kind, source) = bindings.pop().unwrap();
+            if scope_kind == ScopeKind::Local {
+                let frame_ident = format_ident!("__wye_frame_{}", ident);
+                let var_place = hash(source.bytespan);
+                *expr = parse_quote!(({
+                    let __wye_ret = #expr;
+                    __wye.push_var((#frame_ident, #var_place));
+                    __wye.set_last_node((#frame_ident, #var_place));
+                    __wye_ret
+                }));
+            } else {
+                *expr = parse_quote!(({
+                    let __wye_ret = #expr;
+                    __wye.push_var(__wye.last_node());
+                    __wye_ret
+                }));
+            }
+        } else {
+            *expr = parse_quote!(({
+                let __wye_ret = #expr;
+                __wye.push_var(__wye.last_node());
+                __wye_ret
+            }));
+        }
     }
 
     fn visit_fn_block_mut(&mut self, sig: &Signature, node: &mut Block) {
@@ -285,11 +353,9 @@ impl<'ast> Parts<'ast> {
                     let ident_str = ident.to_string();
                     let bytespan = Bytespan::new(self.source_hash, ident.span().unwrap().into());
                     let slot = hash(&bytespan);
-                    eprintln!("FN BYTESPAN: {bytespan:?} SLOT: {slot}");
                     node.stmts.insert(0, parse_quote!(
                         if let Some((__wye_arg_frame, __wye_arg_slot)) = __wye_frame_args.get(#input_slot).copied().flatten() {
                             if __wye_arg_frame != __wye_frame || __wye_arg_slot != #slot {
-                                eprintln!("MATCH: {} found in slot {}", #ident_str, #input_slot);
                                 __wye.edge(__wye_arg_frame, __wye_arg_slot, __wye_frame, #slot);
                             }
                         }
@@ -298,18 +364,155 @@ impl<'ast> Parts<'ast> {
                         __wye.node(__wye_frame, #slot, Some(#ident_str.into()), (&#ident).to_string());
                     ));
                 }
-            }  
+            }
         }
-        node.stmts.insert(0, parse_quote!(eprintln!("FRAME: {}: ARGS: {:?}", __wye_frame, __wye_frame_args);));
         node.stmts.insert(0, parse_quote!(let (__wye_frame, __wye_frame_args) = __wye.frame();));
         node.stmts.insert(0, parse_quote!(let __wye = get_wye();));
+    }
+
+    fn compile(&mut self, stmt_hack: Option<u64>, expr: &mut Expr) {
+        let expr_clone = expr.clone();
+        let expr_source = expr.span().unwrap().source_text();
+        let bindings = self.bindings(expr);
+
+        let place = stmt_hack.unwrap_or_else(|| {
+            hash(Bytespan::new(self.source_hash, expr.span().unwrap().into()))
+        });
+
+        syn::visit_mut::visit_expr_mut(self, expr);
+
+        let mvar: Expr = if let Some(ident) = as_ident(expr) {
+            let ident = ident.to_string();
+            parse_quote!(Some(#ident.into()))
+        } else if let Some(binop) = as_binop(expr) {
+            let binop = binop.to_token_stream().to_string();
+            parse_quote!(Some(#binop.into()))
+        } else if stmt_hack.is_some() {
+            if let Expr::Let(ExprLet{pat: syn::Pat::Ident(ident), ..}) = &expr {
+                let ident = ident.ident.to_string();
+                parse_quote!(Some(#ident.into()))
+            } else {
+                parse_quote!(None::<String>)
+            }
+        } else {
+            parse_quote!(None::<String>)
+        };
+
+        let edges: Vec<Stmt> = if as_ident(expr).is_some() {
+            vec![]
+        } else {
+            bindings.iter().filter_map(|(var_range, var, scope_range, scope_kind, source)| {
+                if scope_kind == &ScopeKind::Fn {
+                    let bytespan = &source.bytespan;
+                    let var_place = hash(&bytespan);
+                    return Some(parse_quote!(
+                        __wye.edge(__wye_frame, #var_place, __wye_frame, #place);
+                    ))
+                } else if scope_kind == &ScopeKind::Local {
+                    let bytespan = &source.bytespan;
+                    let var_place = hash(&bytespan);
+                    let parent_frame = format_ident!("__wye_frame_{}", var.ident);
+                    if stmt_hack.is_none() {
+                        return Some(parse_quote!(
+                            __wye.edge(#parent_frame, #var_place, __wye_outer_frame, #place);
+                        ));
+                    } else {
+                        return Some(parse_quote!(
+                            __wye.edge(__wye_expr_frame, __wye_expr_place, __wye_frame, #var_place);
+                        ))
+                    }
+                }
+                None
+            }).collect::<Vec<_>>()
+        };
+
+        match expr_clone {
+            Expr::Call(_) => {
+                *expr = parse_quote!(({
+                    let _ = "case: Expr::Call";
+                    let _ = #expr_source;
+                    let __wye = get_wye();
+                    let (__wye_outer_frame, _) = __wye.frame();
+                    __wye.declare_node(__wye_outer_frame, #place);
+                    __wye.push_frame();
+                    let __wye_ret = #expr;
+                    __wye.pop_frame();
+                    let (__wye_inner_frame, __wye_inner_slot) = __wye.last_node();
+                    __wye.define_node(__wye_outer_frame, #place, Some(#expr_source.into()), (&__wye_ret).to_string());
+                    __wye.edge(__wye_inner_frame, __wye_inner_slot, __wye_outer_frame, #place);
+                    #(#edges)*;
+                    __wye_ret
+                }));
+            },
+            Expr::Macro(_) => {
+                *expr = parse_quote!(({
+                    let _ = "case: Expr::Macro";
+                    let _ = #expr_source;
+                    let __wye = get_wye();
+                    let (__wye_outer_frame, _) = __wye.frame();
+                    __wye.declare_node(__wye_outer_frame, #place);
+                    let __wye_ret = #expr;
+                    __wye.define_node(__wye_outer_frame, #place, Some(#expr_source.into()), (&__wye_ret).to_string());
+                    #(#edges)*;
+                    __wye_ret
+                }));
+            },
+            Expr::Let(syn::ExprLet{pat: syn::Pat::Ident(ident), expr: inner_expr, ..}) if stmt_hack.is_none() => {
+                *expr = parse_quote!(
+                    (get_wye().frame().0, {
+                        let _ = "case: Expr::Let";
+                        let _ = #expr_source;
+                        let __wye = get_wye();
+                        let (__wye_outer_frame, _) = __wye.frame();
+                        __wye.declare_node(__wye_outer_frame, #place);
+                        __wye.push_frame();
+                        let __wye_ret = #inner_expr;
+                        __wye.pop_frame();
+                        __wye.define_node(__wye_outer_frame, #place, #mvar, (&__wye_ret).to_string());
+                        #(#edges)*;
+                        __wye_ret
+                    })
+                );
+            },
+            Expr::Let(syn::ExprLet{pat: syn::Pat::Ident(ident), expr: mut inner_expr, ..}) => {
+                syn::visit_mut::visit_expr_mut(self, inner_expr.as_mut());
+                *expr = parse_quote!(
+                    (get_wye().frame().0, {
+                        let _ = "case: stmt_hack";
+                        let _ = #expr_source;
+                        let __wye = get_wye();
+                        let (__wye_frame, _) = __wye.frame();
+                        __wye.declare_node(__wye_frame, #place);
+                        let __wye_ret = #inner_expr;
+                        let (__wye_expr_frame, __wye_expr_place) = __wye.last_node();
+                        __wye.define_node(__wye_frame, #place, #mvar, (&__wye_ret).to_string());
+                        #(#edges)*;
+                        __wye.push_frame(); __wye.pop_frame();
+                        __wye_ret
+                    })
+                );
+            },
+            _ if as_ident(&expr_clone).is_none() => {
+                *expr = parse_quote!(({
+                    let _ = "case: non-ident";
+                    let _ = #expr_source;
+                    let __wye = get_wye();
+                    let (__wye_frame, _) = __wye.frame();
+                    __wye.declare_node(__wye_frame, #place);
+                    let __wye_ret = #expr;
+                    __wye.define_node(__wye_frame, #place, #mvar, (&__wye_ret).to_string());
+                    #(#edges)*;
+                    __wye_ret
+                }));
+            },
+            _ => {},
+        }
     }
 }
 
 impl<'ast> VisitMut for Parts<'ast> {
 
     fn visit_item_fn_mut(&mut self, node: &mut ItemFn) {
-        eprintln!("VISIT ITEM FN");
         // See syn::visit_mut::visit_item_fn_mut(self, node);
         let sig_clone = node.sig.clone();
         for it in &mut node.attrs {
@@ -318,7 +521,6 @@ impl<'ast> VisitMut for Parts<'ast> {
         self.visit_visibility_mut(&mut node.vis);
         self.visit_signature_mut(&mut node.sig);
         self.visit_fn_block_mut(&sig_clone, &mut *node.block);
-        eprintln!("VISIT ITEM FN DONE");
     }
 
     fn visit_expr_macro_mut(&mut self, node: &mut ExprMacro) {
@@ -335,7 +537,7 @@ impl<'ast> VisitMut for Parts<'ast> {
 
     fn visit_expr_call_mut(&mut self, node: &mut ExprCall) {
         // See syn::visit_mut::visit_expr_call_mut(self, expr_call);
-        // however, when visiting children, don't visit the actual callable 
+        // however, when visiting children, don't visit the actual callable
         // being called
         for it in &mut node.attrs {
             self.visit_attribute_mut(it);
@@ -346,115 +548,56 @@ impl<'ast> VisitMut for Parts<'ast> {
         }
     }
 
-    fn visit_expr_mut(&mut self, expr: &mut Expr) {
-        let expr_clone = expr.clone();
-        let expr_start = expr.span().unwrap().start();
-        let expr_end = expr.span().unwrap().end();
-        let expr_range = expr_start..expr_end;
-        let scopes = self.scopes.scopes.overlapping(&expr_range);
-        let scopes = scopes.collect::<Vec<_>>();
-        let uses = self.uses.uses.overlapping(&expr_range);
-        let uses = uses.collect::<Vec<_>>();
-        let mut bindings: Vec<(_, Use, _, ScopeKind, Source)> = vec![];
-
-        for (var_range, var) in uses.iter().cloned() {
-            for (scope_range, (scope_kind, sources)) in scopes.iter().cloned().rev() {
-                if scope_range.contains(&var_range.start) && scope_range.contains(&var_range.end) {
-                    sources.0.iter().find(|source| source.ident == var.ident).map(|source| {
-                        bindings.push((var_range, var.clone(), scope_range, *scope_kind, source.clone()));
+    fn visit_stmt_mut(&mut self, stmt: &mut Stmt) {
+        let expr_clone = stmt.clone();
+        let expr_source = stmt.span().unwrap().source_text();
+        match stmt {
+            Stmt::Local(local) => {
+                if let Local{attrs, let_token, pat: pat@syn::Pat::Ident(ident), init: Some((eq_token, expr)), semi_token} = &local {
+                    let expr = Box::new(*expr.clone());
+                    let mut fake_expr = Expr::Let(ExprLet{
+                        attrs: attrs.clone(),
+                        let_token: let_token.clone(),
+                        pat: pat.clone(),
+                        eq_token: eq_token.clone(),
+                        expr,
                     });
-                    break;
+                    let ident_frame_var = format_ident!("__wye_frame_{}", ident.ident);
+                    self.compile(Some(hash(Bytespan::new(self.source_hash, ident.ident.span()))), &mut fake_expr);
+                    let mut pat_elems: Punctuated<syn::Pat, Comma> = Default::default();
+                    let pat_arg_frame = syn::Pat::Ident(syn::PatIdent{
+                        attrs: vec![],
+                        by_ref: None,
+                        mutability: None,
+                        ident: ident_frame_var,
+                        subpat: None,
+                    });
+                    pat_elems.push_value(pat_arg_frame);
+                    pat_elems.push_punct(syn::token::Comma::default());
+                    pat_elems.push_value(pat.clone());
+                    *stmt = Stmt::Local(Local{
+                        attrs: attrs.clone(),
+                        let_token: let_token.clone(),
+                        pat: syn::Pat::Tuple(syn::PatTuple{
+                            attrs: vec![],
+                            paren_token: syn::token::Paren::default(),
+                            elems: pat_elems,
+                        }),
+                        init: Some((eq_token.clone(), Box::new(fake_expr))),
+                        semi_token: semi_token.clone(),
+                    });
+                } else {
+                    syn::visit_mut::visit_stmt_mut(self, stmt);
                 }
+            },
+            _ => {
+                syn::visit_mut::visit_stmt_mut(self, stmt);
             }
         }
+    }
 
-        eprintln!("EXPR: {}", expr.to_token_stream().to_string());
-        // eprintln!("SCOPES: {:#?}", scopes);
-        eprintln!("USES: {:#?}", uses);
-        eprintln!("BINDINGS: {:#?}", bindings);
-
-        let place = hash(Bytespan::new(self.source_hash, expr.span().unwrap().into()));
-
-        syn::visit_mut::visit_expr_mut(self, expr);
-
-        let mvar: Expr = if let Some(ident) = as_ident(expr) {
-            let ident = ident.to_string();
-            parse_quote!(Some(#ident.into()))
-        } else if let Some(binop) = as_binop(expr) {
-            let binop = binop.to_token_stream().to_string();
-            parse_quote!(Some(#binop.into()))
-        } else {
-            parse_quote!(None::<String>)
-        };
-
-        let edges: Vec<Stmt> = if as_ident(expr).is_some() {
-            vec![]
-        } else {
-            bindings.iter().filter_map(|(var_range, var, scope_range, scope_kind, source)| {
-                if scope_kind == &ScopeKind::Fn {
-                    let bytespan = &source.bytespan;
-                    let var_place = hash(&bytespan);
-                    eprintln!("CALL BYTESPAN: {bytespan:?} SLOT: {var_place}");
-                    return Some(parse_quote!(
-                        __wye.edge(__wye_frame, #var_place, __wye_frame, #place);
-                    ))
-                }
-                None
-            }).collect::<Vec<_>>()
-        };
-        // eprintln!("EDGES: {edges:?}");
-        eprintln!("");
-
-        let expr_source = expr.span().unwrap().source_text();
-        match expr_clone {
-            Expr::Call(_) => {
-                *expr = parse_quote!((/* #[doc=#expr_source] */{
-                    let _ = #expr_source;
-                    let __wye = get_wye();
-                    let (__wye_outer_frame, _) = __wye.frame();
-                    __wye.declare_node(__wye_outer_frame, #place);
-                    __wye.push_frame();
-                    let __wye_ret = #expr;
-                    __wye.pop_frame();
-                    let (__wye_inner_frame, __wye_inner_slot) = __wye.last_node();
-                    __wye.define_node(__wye_outer_frame, #place, Some(#expr_source.into()), (&__wye_ret).to_string());
-                    __wye.edge(__wye_inner_frame, __wye_inner_slot, __wye_outer_frame, #place);
-                    #(#edges)*;
-                    __wye_ret
-                }));
-            },
-            Expr::Macro(_) => {
-                *expr = parse_quote!((/* #[doc=#expr_source] */{
-                    let _ = #expr_source;
-                    let __wye = get_wye();
-                    let (__wye_outer_frame, _) = __wye.frame();
-                    __wye.declare_node(__wye_outer_frame, #place);
-                    let __wye_ret = #expr;
-                    __wye.define_node(__wye_outer_frame, #place, Some(#expr_source.into()), (&__wye_ret).to_string());
-                    #(#edges)*;
-                    __wye_ret
-                }));
-            },
-            _ if as_ident(&expr_clone).is_none() => {
-                *expr = parse_quote!(({
-                    let _ = #expr_source;
-                    let __wye = get_wye();
-                    let (__wye_frame, _) = __wye.frame();
-                    __wye.declare_node(__wye_frame, #place);
-                    let __wye_ret = #expr;
-                    __wye.define_node(__wye_frame, #place, #mvar, (&__wye_ret).to_string());
-                    #(#edges)*;
-                    __wye_ret
-                }));
-            },
-            _ => {},
-        }
-
-
-        // let place = scopes.place(expr.span());
-        // let sources = scopes.sources(expr.span());
-        // let uses = scopes.uses(expr.span());
-        // eprintln!("SCOPES: {scopes:?}");
+    fn visit_expr_mut(&mut self, expr: &mut Expr) {
+        self.compile(None, expr);
     }
 }
 
@@ -630,10 +773,10 @@ pub fn wye(args: proc_macro::TokenStream, input: proc_macro::TokenStream) -> pro
         WyeArgMap::new()
     };
     let _ = args;
-    
+
     let mut input = parse_macro_input!(input as Item);
-    
-    let source_hash = hash(proc_macro::Span::call_site().source_text().unwrap()); 
+
+    let source_hash = hash(proc_macro::Span::call_site().source_text().unwrap());
 
     let mut scopes = Scopes::new(source_hash);
     scopes.visit_item(&input);
@@ -643,7 +786,7 @@ pub fn wye(args: proc_macro::TokenStream, input: proc_macro::TokenStream) -> pro
 
     let mut parts = Parts::new(source_hash, &scopes, &uses);
     parts.visit_item_mut(&mut input);
-    
+
     let tokens = input.into_token_stream();
     tokens.into()
 }
@@ -651,13 +794,15 @@ pub fn wye(args: proc_macro::TokenStream, input: proc_macro::TokenStream) -> pro
 #[proc_macro]
 pub fn wyre(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let mut input = parse_macro_input!(input as WyreExpr);
-    
+
     let args = input.args.as_ref().map(|args| args.1.process()).unwrap_or_else(WyeArgMap::new);
     let _ = args;
 
     let source_hash = hash(proc_macro::Span::call_site().source_text().unwrap());
-    
+    let span = input.span().unwrap();
+
     let mut scopes = Scopes::new(source_hash);
+    scopes.push_scope(ScopeKind::Block, span.start(), span.end());
     for stmt in &input.stmts.0 {
         scopes.visit_stmt(stmt)
     }
@@ -671,6 +816,9 @@ pub fn wyre(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     for stmt in &mut input.stmts.0 {
         parts.visit_stmt_mut(stmt);
     }
+
+    input.stmts.0.insert(0, parse_quote!(__wye.push_frame();));
+    input.stmts.0.insert(0, parse_quote!(let __wye = get_wye();));
 
     let tokens = input.into_token_stream();
     tokens.into()
