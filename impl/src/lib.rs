@@ -467,21 +467,38 @@ impl<'ast> Parts<'ast> {
             },
             Expr::Let(syn::ExprLet{pat: syn::Pat::Ident(_ident), expr: mut inner_expr, ..}) => {
                 syn::visit_mut::visit_expr_mut(self, inner_expr.as_mut());
-                *expr = parse_quote!(
-                    (get_wye().frame().0, {
-                        let _ = "case: stmt_hack";
-                        let _ = #expr_source;
-                        let __wye = get_wye();
-                        let (__wye_frame, _) = __wye.frame();
-                        __wye.declare_node(__wye_frame, #place);
-                        let __wye_ret = #inner_expr;
-                        let (__wye_expr_frame, __wye_expr_place) = __wye.last_node();
-                        __wye.define_node(__wye_frame, #place, #mvar, (&__wye_ret).to_string());
-                        #(#edges)*;
-                        __wye.push_frame(); __wye.pop_frame();
-                        __wye_ret
-                    })
-                );
+                // only emit edges if inner_expr will have defined a last_node:
+                if matches!(&*inner_expr, Expr::Lit(_)) {
+                    *expr = parse_quote!(
+                        (get_wye().frame().0, {
+                            let _ = "case: stmt_hack.lit";
+                            let _ = #expr_source;
+                            let __wye = get_wye();
+                            let (__wye_frame, _) = __wye.frame();
+                            __wye.declare_node(__wye_frame, #place);
+                            let __wye_ret = #inner_expr;
+                            __wye.define_node(__wye_frame, #place, #mvar, (&__wye_ret).to_string());
+                            __wye.push_frame(); __wye.pop_frame();
+                            __wye_ret
+                        })
+                    );
+                } else {
+                    *expr = parse_quote!(
+                        (get_wye().frame().0, {
+                            let _ = "case: stmt_hack";
+                            let _ = #expr_source;
+                            let __wye = get_wye();
+                            let (__wye_frame, _) = __wye.frame();
+                            __wye.declare_node(__wye_frame, #place);
+                            let __wye_ret = #inner_expr;
+                            let (__wye_expr_frame, __wye_expr_place) = __wye.last_node();
+                            __wye.define_node(__wye_frame, #place, #mvar, (&__wye_ret).to_string());
+                            #(#edges)*;
+                            __wye.push_frame(); __wye.pop_frame();
+                            __wye_ret
+                        })
+                    );
+                }
             },
             _ if as_ident(&expr_clone).is_none() => {
                 *expr = parse_quote!(({
