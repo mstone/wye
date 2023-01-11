@@ -1,0 +1,15 @@
+#![feature(cfg_target_thread_local)]
+#![feature(core_panic)]
+#![feature(derive_clone_copy)]
+#![feature(fmt_helpers_for_derive)]
+#![feature(fmt_internals)]
+#![feature(prelude_import)]
+#![feature(print_internals)]
+#![feature(rt)]
+#![feature(rustc_attrs)]
+#![feature(structural_match)]
+#![feature(thread_local)]
+#![feature(thread_local_internals)]
+#![feature(test)]
+extern crate alloc;
+use crate::alloc::boxed::Box;

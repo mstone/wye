@@ -1,0 +1,146 @@
+= wye
+v0.1, 2023-01-01
+Michael Stone
+:toc:
+:homepage: https://github.com/mstone/wye
+:numbered:
+:sectlinks:
+:icons: font
+
+ifdef::env-github[:outfilesuffix: .adoc]
+
+== Introduction
+
+wye was an unsuccessful experiment to create a source-level "declarative time travel debugger" for Rust.
+
+== Learnings
+
+The initial design used proc-macros to transform annotated rust items and expressions to log their outputs.
+
+This design ran into problems because while the macros I wrote did a great job of simplifying the process of repetitively transforming input code, they don't presently have access to type/trait information, nor to the whole program souce, which is a problem because while it's fairly straightforward to transform selected input source code to capture the required dataflow, it's really hard to predict which sub-terms are likely to evaluate to formattable values vs which don't, which is necessary to get the resulting program to type-check.
+
+Following in the footsteps of https://willcrichton.net/notes/type-directed-metaprogramming-in-rust/[Will Crichton]: a type-directed custom compiler driver is still possible, but I think would be even more complicated :-/.
+
+It's also a challenge that rust's type-inference seems to be fragile with regard to expression-rewriting, which leads to requiring use-site hacks like writing `Into::<String>::into(...)` instead of `(...).into()`, to get the transformed output to typecheck.
+
+Finally, I also considered trying to solve the problem differently with https://rr-project.org[rr] on Linux. The good news here was that rr did a great job recording a relevant program execution. The bad news is that, without better access to formatting code for all these internal values, the resulting recording isn't yet very helpful for solving my actual program execution understanding problem.
+
+== Design
+
+The goal here is to derive every value of interest that the program 
+being annotated computes by
+
+[[R-1]]
+.R-1: Record All Values
+recording all the values we need to record and
+
+[[R-2]]
+.R-2: Record All Dependencies
+recording all the dependencies between values we need to record.
+
+=== The Problem
+
+[[P-0]]
+.P-0: Mechanism
+what basic mechanism should the solution use?
+
+The options here are
+
+* _a library_
+* *a macro*
+* _a compiler plugin_
+* _a compiler wrapper_
+* _a debugger_
+* _an execution recording translator_
+
+[sidebar]
+Note: the experiment that didn't work explored two versions of the macro-based solution, one using custom matching logic, and a second using the `syn::visit::Visit` and `syn::visit_mut::VisitMut` traits.
+
+Next, assuming a macro-based mechanism: 
+
+[[P-1]]
+.P-1: Addressing through Staging
+based on information available at macro-expansion time, how can we generate code that addresses the "values" and "dependencies" mentioned by <<R-1>> and <<R-2>> at run-time?
+
+To illustrate the issue, let's also look at a specific sub-problem:
+
+[[P-2]]
+.P-2: Addressing Variable Mentions
+when generating code intended to hook up the actual data flow for an expr involving a variable mention, we need to look up the source/producer data flow coordinates for the value the variable will be bound to, which we can only do at macro expansion time via that mentions’ binder. 
+
+[[P-3]]
+.P-3: Inductive Addressing
+And since we want to do this inductively for all exprs, not just for leaf variable mentions, we need to do this both for organic binders and for the synthetic binders that we’re going to introduce to capture intermediate expression results.
+
+=== The Solution
+
+One potential solution to the problems above is to solve <<P-2>> by assigning coordinates to everything in sight, to solve <<P-3>> by translating everything in sight into continuation-passing style, and to solve <<P-1>> by carefully tracking binding information.
+
+This implies:
+
+[[C-1]]
+.C-1: Input Coordinates
+we need to be able to obtain run-time coordinates for all the values that are used to evaluate the sub-terms of the expr / syntax
+
+[[C-2]]
+.C-2: Producer Coordinates
+we need to be able to obtain compile-time coodinates for the sources or "producers" whose evaluation or execution produces values
+
+[[C-3]]
+.C-3: Output Coordinates
+we need to be able to assign run-time coordinates to the value(s) that source or producer exprs evaluate to for use by downstream computations
+
+[[C-4]]
+.C-4: Consumer Coordinates
+we need to be able to assign compile-time coordinates to the sinks or "consumers" whose evaluation or execution consumes previously captured and tracked input values
+
+[[C-5]]
+.C-5: Dependencies via Coordinates
+using the relevant compile-time coordinates, we need to be able to record dependencies between the runtime coordinates of the inputs, outputs, producers, and consumers
+
+[[C-6]]
+.C-6: Local Coordinate Computation
+in a way that works given only the local syntactic information available to us at compile time + whatever we can look up at runtime based on this local syntactic information
+
+[[C-7]]
+.C-7: Compile-time Coordinates 
+Thus, every piece of syntax will have compile-time coordinates consisting of a stack of enums with variants for:
+
+* a call-site
+* a sequence index, 
+* a choice of enum discriminant, 
+* a struct/tuple field?
+
+[[C-8]]
+.C-8: Run-time Coordinates
+and every place? will have run-time coordinates consisting of a 
+struct with fields for:
+
+* a thread-index
+* a frame-index
+* a binder-index
+
+to move between these, there will be a tree of scopes, available
+at both compile-time and run-time:
+
+[[B-1]]
+.B-1: Scopes
+recording which binders are in-scope at this coordinate
+
+[[B-2]]
+.B-2: Variable Occurrences
+allowing variable occurrences to be resolved to their corresponding binders
+
+[[B-3]]
+.B-3: Value Coordinates
+allowing the coordinates of the values those binders are bound to in a given execution to be looked up.
+
+=== Subsequent problems
+
+A key issue in the analysis is to distiguish which subexprs need their own nodes (and so need edges that look like inputs -> subexpr -> expr -> output) vs that don't need their own nodes (and so need edges that look like inputs -> expr -> output).
+
+A followon issue is: the inputs can be bound by an explicit binder, like a function argument or a input-level let, or they can be handled at the input-level by application, rather than binding.
+
+
+
+
